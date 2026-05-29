@@ -15,7 +15,7 @@ PROMPT = "Write a Python function that returns the nth Fibonacci number."
 print(f"Loading {MODEL} ...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL)
 model = AutoModelForCausalLM.from_pretrained(
-    MODEL, torch_dtype=torch.bfloat16, device_map="auto"
+    MODEL, dtype=torch.bfloat16, device_map="auto"
 )
 
 inputs = tokenizer(

@@ -444,7 +444,7 @@ if __name__ == "__main__":
     print(f"Loading {model_id} ...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model     = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.float16, device_map="auto"
+        model_id, dtype=torch.float16, device_map="auto"
     )
 
     prompt = "The quick brown fox jumps over the lazy dog. " * 100
