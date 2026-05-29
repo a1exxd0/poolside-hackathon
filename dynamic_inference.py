@@ -52,7 +52,7 @@ def load_model_and_tokenizer():
     )
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="auto",
         token=os.getenv("HF_TOKEN"),
     )
@@ -67,12 +67,16 @@ def load_model_and_tokenizer():
 def encode_prompt(prompt: str, tokenizer, model) -> torch.Tensor:
     """Apply the Laguna chat template and return a 1-D input_ids tensor."""
     messages = [{"role": "user", "content": prompt}]
-    input_ids = tokenizer.apply_chat_template(
+    result = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
         return_tensors="pt",
-    ).to(model.device)
-    return input_ids.squeeze(0)  # [L]
+    )
+    # apply_chat_template returns a plain tensor or a BatchEncoding depending
+    # on the transformers version; normalise to a tensor here.
+    if not isinstance(result, torch.Tensor):
+        result = result["input_ids"]
+    return result.squeeze(0).to(model.device)  # [L]
 
 
 def baseline_generate(input_ids: torch.Tensor, model, tokenizer, max_new_tokens: int = 64):
