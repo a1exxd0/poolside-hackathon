@@ -22,6 +22,7 @@ Usage
 """
 
 import argparse
+import re
 import time
 import os
 
@@ -39,6 +40,21 @@ from dynamic_tokenizer import (
 load_dotenv()
 
 MODEL_ID = "poolside/Laguna-XS.2"
+
+
+def strip_think_block(text: str) -> str:
+    """Remove <think>...</think> reasoning content from model output.
+
+    Laguna prepends <think> to the generation prompt.  <think> is a special
+    token so it is skipped by the tokenizer's decode, but </think> is a
+    regular text token that stays in the output.  This strips the dangling
+    closing tag (and any full think blocks, should they appear).
+    """
+    # Leading </think> — opening tag was in the input prompt, not in output
+    text = re.sub(r'^</think>\s*', '', text)
+    # Full <think>...</think> blocks (e.g. if the model re-opens one)
+    text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+    return text.strip()
 
 # ---------------------------------------------------------------------------
 # Model loading
@@ -92,6 +108,7 @@ def baseline_generate(input_ids: torch.Tensor, model, tokenizer, max_new_tokens:
     response = tokenizer.decode(
         output_ids[0][input_ids.shape[0]:], skip_special_tokens=True
     )
+    response = strip_think_block(response)
     return response, elapsed
 
 
@@ -148,7 +165,7 @@ def dynamic_generate(
         )
 
     elapsed = time.perf_counter() - t0
-    response = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    response = strip_think_block(tokenizer.decode(output_ids[0], skip_special_tokens=True))
 
     return response, original_len, merged_len, elapsed
 
@@ -231,20 +248,30 @@ def main():
     methods = ["whitespace", "entropy", "unigram"] if args.method == "all" else [args.method]
 
     if args.prompt:
-        # Single-prompt mode
+        # Single-prompt comparison mode: baseline first, then each dynamic method.
         cache = EmbeddingCache()
+        input_ids = encode_prompt(args.prompt, tokenizer, model)
+        orig_len = input_ids.shape[0]
+
+        print(f"\nPrompt : {args.prompt}")
+        print(f"Tokens : {orig_len}  |  max_new_tokens={args.max_new_tokens}")
+        print("─" * 70)
+
+        baseline_resp, baseline_time = baseline_generate(
+            input_ids, model, tokenizer, args.max_new_tokens
+        )
+        print(f"[baseline] {baseline_time:.2f}s")
+        print(f"[baseline] {baseline_resp}\n")
+
         for method in methods:
-            input_ids = encode_prompt(args.prompt, tokenizer, model)
-            orig_len = input_ids.shape[0]
-
-            print(f"\n[{method}] Original tokens: {orig_len}")
-
             dyn_resp, orig_len, merged_len, dyn_time = dynamic_generate(
                 input_ids, model, tokenizer, method, cache, args.max_new_tokens
             )
             sf = shortening_factor(orig_len, merged_len)
-            print(f"[{method}] Merged tokens  : {merged_len} (SF {sf:.2f}x, {dyn_time:.2f}s)")
-            print(f"[{method}] Response        : {dyn_resp}")
+            speedup = baseline_time / dyn_time if dyn_time > 0 else float("inf")
+            print(f"[{method}] {merged_len}/{orig_len} tokens  SF {sf:.2f}x  "
+                  f"{dyn_time:.2f}s  speedup {speedup:.2f}x")
+            print(f"[{method}] {dyn_resp}\n")
     else:
         for method in methods:
             run_demo(model, tokenizer, method, args.max_new_tokens)

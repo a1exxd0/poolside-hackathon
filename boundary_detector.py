@@ -179,6 +179,25 @@ def unigram_boundaries(
     return boundaries
 
 
+def special_token_boundaries(input_ids: torch.Tensor, tokenizer) -> torch.Tensor:
+    """
+    Force a segment boundary before AND after every special token.
+
+    Special tokens (BOS, EOS, <think>, pad, etc.) must never be merged with
+    adjacent tokens — their embeddings carry learned positional meaning that
+    averaging would destroy.
+    """
+    L = input_ids.shape[0]
+    boundaries = torch.zeros(L, dtype=torch.bool)
+    special_ids = set(tokenizer.all_special_ids)
+    for t, tid in enumerate(input_ids.tolist()):
+        if tid in special_ids:
+            if t > 0:
+                boundaries[t - 1] = True  # close segment before special token
+            boundaries[t] = True           # special token forms its own segment
+    return boundaries
+
+
 def detect_boundaries(
     input_ids: torch.Tensor,
     method: str,
@@ -200,13 +219,19 @@ def detect_boundaries(
         boundaries: BoolTensor [L], True = boundary after that position.
     """
     if method == "whitespace":
-        return whitespace_boundaries(input_ids, tokenizer)
+        b = whitespace_boundaries(input_ids, tokenizer)
     elif method == "entropy":
         if model is None:
             raise ValueError("method='entropy' requires a model argument")
-        return entropy_spike_boundaries(input_ids, model, tokenizer, **kwargs)
+        b = entropy_spike_boundaries(input_ids, model, tokenizer, **kwargs)
     elif method == "unigram":
-        return unigram_boundaries(input_ids, tokenizer, **kwargs)
+        b = unigram_boundaries(input_ids, tokenizer, **kwargs)
     else:
         raise ValueError(f"Unknown boundary method: {method!r}. "
                          f"Choose from 'whitespace', 'entropy', 'unigram'.")
+
+    # Special tokens (BOS, <think>, EOS, etc.) must never be merged.
+    special = special_token_boundaries(input_ids.cpu(), tokenizer).to(b.device)
+    b = b | special
+    b[-1] = True
+    return b
