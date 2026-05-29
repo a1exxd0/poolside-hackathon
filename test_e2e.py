@@ -35,6 +35,7 @@ result = generate_with_hierarchy(
     budget=256, sink=4, recent=64,
     k_topics=3, k_leaves=4, beta=16,
     eos_token_id=tokenizer.eos_token_id,
+    verbose=True,
 )
 
 output = tokenizer.decode(

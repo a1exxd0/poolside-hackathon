@@ -273,6 +273,7 @@ def generate_with_hierarchy(
     k_leaves:       int = 4,
     beta:           int = 32,
     eos_token_id:   Optional[int] = None,
+    verbose:        bool = False,
 ) -> dict:
     """
     Hierarchical KV cache generation.
@@ -313,7 +314,9 @@ def generate_with_hierarchy(
     qcap.install(model)
 
     # ── Prefill ───────────────────────────────────────────────────────────
-    cache = DynamicCache()
+    # Pass model.config so DynamicCache creates SlidingWindowLayer for the
+    # right layers — without it every layer becomes DynamicLayer (is_sliding=False).
+    cache = DynamicCache(config=model.config)
     with torch.no_grad():
         out = model(input_ids, past_key_values=cache, use_cache=True)
 
@@ -322,8 +325,35 @@ def generate_with_hierarchy(
 
     # Sliding-window layers manage their own fixed window — never touch them.
     # Only full-attention layers get hierarchical eviction.
-    full_attn = [l for l in range(n_layers)
-                 if not getattr(cache.layers[l], "is_sliding", False)]
+    full_attn   = [l for l in range(n_layers)
+                   if not getattr(cache.layers[l], "is_sliding", False)]
+    sliding     = [l for l in range(n_layers) if l not in full_attn]
+
+    if verbose:
+        print(f"\n[hierarchy] Prompt: {prefill_len} tokens")
+        print(f"[hierarchy] Layers — full-attention: {len(full_attn)}, "
+              f"sliding-window: {len(sliding)}")
+        print(f"[hierarchy] Full-attn indices (first 10): {full_attn[:10]}")
+
+        tree = pipeline._hierarchy.get_tree()
+        print(f"\n[hierarchy] Tree — {len(tree.leaf_clusters)} leaf clusters, "
+              f"{len(tree.topic_nodes)} topic nodes")
+        nodes_info = hier["nodes"]
+        for cid, cluster in sorted(tree.leaf_clusters.items()):
+            positions = sorted({
+                p
+                for nid in cluster.member_node_ids
+                for p in node_token_map.get(nid, [])
+            })
+            texts = [nodes_info[nid]["text"][:40] for nid in cluster.member_node_ids
+                     if nid in nodes_info]
+            print(f"  Cluster {cid}: {len(cluster.member_node_ids)} nodes, "
+                  f"{len(positions)} tokens [{positions[0] if positions else '?'}"
+                  f"–{positions[-1] if positions else '?'}]")
+            for t in texts:
+                print(f"    · {t!r}")
+        for tid, topic in sorted(tree.topic_nodes.items()):
+            print(f"  Topic {tid}: leaves {topic.leaf_cluster_ids}")
 
     # Immutable flat backing store for full-attention layers only
     prefill_keys   = {l: cache.layers[l].keys[0].clone()   for l in full_attn}
@@ -370,6 +400,12 @@ def generate_with_hierarchy(
             pk = torch.cat([pk, gen_k[:, -n_recent_gen:, :]], dim=1)
             pv = torch.cat([pv, gen_v[:, -n_recent_gen:, :]], dim=1)
 
+        if verbose:
+            n_quest = len(quest_pos - sink_pos)
+            print(f"  [layer {l}] prefill selected: {len(prefill_pos)} tokens "
+                  f"({len(sink_pos)} sink + {n_quest} quest), "
+                  f"+ {n_recent_gen} recent_gen → active {len(prefill_pos) + n_recent_gen}")
+
         return pk.unsqueeze(0), pv.unsqueeze(0)   # [1, n_kv, active, head_dim]
 
     # ── Initialise active cache for full-attention layers ─────────────────
@@ -377,11 +413,16 @@ def generate_with_hierarchy(
                                  dtype=prefill_keys[l].dtype) for l in full_attn}
     gen_values = {l: torch.empty_like(gen_keys[l])             for l in full_attn}
 
+    if verbose:
+        print(f"\n[hierarchy] Initial cache reconstruction "
+              f"(showing first 3 full-attn layers):")
     for l in full_attn:
         q = qcap.queries.get(l, prefill_keys[l][:, -1, :])
         cache.layers[l].keys, cache.layers[l].values = reconstruct(
-            l, q, gen_keys[l], gen_values[l]
+            l, q, gen_keys[l], gen_values[l],
         )
+        if verbose and l > full_attn[min(2, len(full_attn)-1)]:
+            pass  # already printed inside reconstruct
 
     # ── Decode loop ───────────────────────────────────────────────────────
     next_tok  = out.logits[:, -1:, :].argmax(dim=-1)
@@ -410,6 +451,9 @@ def generate_with_hierarchy(
 
         # Every β steps: rebuild full-attention layer caches
         if (step + 1) % beta == 0:
+            if verbose:
+                print(f"\n[hierarchy] Eviction at step {step+1} "
+                      f"(generated {step+1} tokens so far):")
             for l in full_attn:
                 q = qcap.queries.get(l, prefill_keys[l][:, -1, :])
                 cache.layers[l].keys, cache.layers[l].values = reconstruct(
