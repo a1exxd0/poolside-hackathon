@@ -218,11 +218,13 @@ class _QueryCapture:
 
             def make_hook(li, nq, nkv):
                 def hook(module, inp, output):
-                    last = output[0, -1]                     # [n_q * head_dim]
-                    hd   = last.numel() // nq                # actual head_dim
-                    q    = last.reshape(nq, hd)              # [n_q, head_dim]
+                    last = output[0, -1]          # [n_q * head_dim]
+                    if last.numel() % nq != 0:
+                        return                     # layer has different head count; use fallback
+                    hd = last.numel() // nq
+                    q  = last.reshape(nq, hd)
                     if nq != nkv:
-                        q = q.reshape(nkv, nq // nkv, hd).mean(1)  # [n_kv, head_dim]
+                        q = q.reshape(nkv, nq // nkv, hd).mean(1)
                     self.queries[li] = q.detach()
                 return hook
 

@@ -44,4 +44,18 @@ output = tokenizer.decode(
 print(f"\nLeaf clusters: {result['n_leaf_clusters']}, topic nodes: {result['n_topic_nodes']}")
 print(f"Final KV lengths (first 5 layers): {result['final_kv_lens'][:5]}")
 print(f"Layer budgets   (first 5 layers): {result['layer_budgets'][:5]}")
-print(f"\n--- Output ---\n{output}")
+print(f"\n--- Hierarchical output ---\n{output}")
+
+# Baseline: standard generation with full cache
+print("\nRunning baseline (full cache) ...")
+with torch.no_grad():
+    baseline_ids = model.generate(
+        **inputs,
+        max_new_tokens=200,
+        do_sample=False,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+baseline_output = tokenizer.decode(
+    baseline_ids[0][inputs.input_ids.size(1):], skip_special_tokens=True
+)
+print(f"\n--- Baseline output ---\n{baseline_output}")
