@@ -50,10 +50,10 @@ def strip_think_block(text: str) -> str:
     regular text token that stays in the output.  This strips the dangling
     closing tag (and any full think blocks, should they appear).
     """
-    # Leading </think> — opening tag was in the input prompt, not in output
-    text = re.sub(r'^</think>\s*', '', text)
-    # Full <think>...</think> blocks (e.g. if the model re-opens one)
-    text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+    # Full <think>...</think> blocks (model re-opened one in the output)
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    # Leading whitespace + </think> — opening tag was in the input, thus skipped
+    text = re.sub(r'^\s*</think>', '', text)
     return text.strip()
 
 # ---------------------------------------------------------------------------
@@ -232,7 +232,7 @@ def main():
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=64,
+        default=256,
         help="Max tokens to generate",
     )
     parser.add_argument(
