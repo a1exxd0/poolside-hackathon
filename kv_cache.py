@@ -321,8 +321,8 @@ def generate_with_hierarchy(
     current_pos = prefill_len
 
     # Immutable flat backing store: full prefill K/V, never modified
-    prefill_keys   = [cache.key_cache[l][0].clone()   for l in range(n_layers)]
-    prefill_values = [cache.value_cache[l][0].clone() for l in range(n_layers)]
+    prefill_keys   = [cache.layers[l].keys[0].clone()   for l in range(n_layers)]
+    prefill_values = [cache.layers[l].values[0].clone() for l in range(n_layers)]
 
     # Derive actual shapes from the cache rather than the config
     # (Laguna's head_dim != hidden_size // n_q_heads)
@@ -385,7 +385,7 @@ def generate_with_hierarchy(
 
     for l in range(n_layers):
         q = qcap.queries.get(l, prefill_keys[l][:, -1, :])
-        cache.key_cache[l], cache.value_cache[l] = reconstruct(
+        cache.layers[l].keys, cache.layers[l].values = reconstruct(
             l, q, gen_keys[l], gen_values[l]
         )
 
@@ -410,15 +410,15 @@ def generate_with_hierarchy(
         # Accumulate the new token's K/V into the generated store
         for l in range(n_layers):
             gen_keys[l]   = torch.cat([gen_keys[l],
-                                        cache.key_cache[l][0, :, -1:, :]],   dim=1)
+                                        cache.layers[l].keys[0, :, -1:, :]],   dim=1)
             gen_values[l] = torch.cat([gen_values[l],
-                                        cache.value_cache[l][0, :, -1:, :]], dim=1)
+                                        cache.layers[l].values[0, :, -1:, :]], dim=1)
 
         # Every β steps: rebuild active cache from hierarchy selection
         if (step + 1) % beta == 0:
             for l in range(n_layers):
                 q = qcap.queries.get(l, prefill_keys[l][:, -1, :])
-                cache.key_cache[l], cache.value_cache[l] = reconstruct(
+                cache.layers[l].keys, cache.layers[l].values = reconstruct(
                     l, q, gen_keys[l], gen_values[l]
                 )
 
@@ -432,7 +432,7 @@ def generate_with_hierarchy(
                                [input_ids, torch.tensor([generated], device=device)], dim=1
                            ),
         "generated_ids":   generated,
-        "final_kv_lens":   [cache.key_cache[l].size(2) for l in range(n_layers)],
+        "final_kv_lens":   [cache.layers[l].get_seq_length() for l in range(n_layers)],
         "layer_budgets":   layer_budgets,
         "n_leaf_clusters": len(tree.leaf_clusters),
         "n_topic_nodes":   len(tree.topic_nodes),
