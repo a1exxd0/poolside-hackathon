@@ -377,7 +377,13 @@ def generate_with_hierarchy(
         budget_l     = layer_budgets[l]
         n_recent_gen = min(recent, gen_k.size(1))
 
-        sink_pos  = set(range(min(sink, prefill_len)))
+        # Always keep: first `sink` tokens (attention sinks) and last `sink`
+        # prefill tokens (chat-template boundary / </think> / start-of-answer
+        # tokens that the model needs to know what to generate).
+        sink_pos   = set(range(min(sink, prefill_len)))
+        tail_pos   = set(range(max(sink, prefill_len - sink), prefill_len))
+        always_pos = sink_pos | tail_pos
+
         quest_pos = select_by_hierarchy(
             query,
             layer_topic_inodes[l],
@@ -386,12 +392,12 @@ def generate_with_hierarchy(
             k_leaves=k_leaves,
         )
 
-        prefill_pos = sorted(sink_pos | quest_pos)
+        prefill_pos = sorted(always_pos | quest_pos)
         max_prefill = budget_l - n_recent_gen
         if len(prefill_pos) > max_prefill:
-            quest_only  = sorted(quest_pos - sink_pos)
-            allowed     = max(0, max_prefill - len(sink_pos))
-            prefill_pos = sorted(sink_pos | set(quest_only[:allowed]))
+            quest_only  = sorted(quest_pos - always_pos)
+            allowed     = max(0, max_prefill - len(always_pos))
+            prefill_pos = sorted(always_pos | set(quest_only[:allowed]))
 
         pk = prefill_keys[l][:,   prefill_pos, :]
         pv = prefill_values[l][:, prefill_pos, :]
@@ -401,9 +407,9 @@ def generate_with_hierarchy(
             pv = torch.cat([pv, gen_v[:, -n_recent_gen:, :]], dim=1)
 
         if verbose:
-            n_quest = len(quest_pos - sink_pos)
+            n_quest = len(quest_pos - always_pos)
             print(f"  [layer {l}] prefill selected: {len(prefill_pos)} tokens "
-                  f"({len(sink_pos)} sink + {n_quest} quest), "
+                  f"({len(always_pos)} always + {n_quest} quest), "
                   f"+ {n_recent_gen} recent_gen → active {len(prefill_pos) + n_recent_gen}")
 
         return pk.unsqueeze(0), pv.unsqueeze(0)   # [1, n_kv, active, head_dim]
