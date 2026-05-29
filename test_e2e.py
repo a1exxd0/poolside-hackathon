@@ -41,7 +41,7 @@ output = tokenizer.decode(
     result["sequences"][0][inputs.input_ids.size(1):], skip_special_tokens=True
 )
 
-print(f"\nLeaf clusters: {result['n_leaf_clusters']}, topic nodes: {result['n_topic_nodes']}")
+print(f"\nFull-attention layers evicted: {result['n_full_attn']}, leaf clusters: {result['n_leaf_clusters']}, topic nodes: {result['n_topic_nodes']}")
 print(f"Final KV lengths (first 5 layers): {result['final_kv_lens'][:5]}")
 print(f"Layer budgets   (first 5 layers): {result['layer_budgets'][:5]}")
 print(f"\n--- Hierarchical output ---\n{output}")

@@ -320,34 +320,30 @@ def generate_with_hierarchy(
     prefill_len = input_ids.size(1)
     current_pos = prefill_len
 
-    # Immutable flat backing store: full prefill K/V, never modified
-    prefill_keys   = [cache.layers[l].keys[0].clone()   for l in range(n_layers)]
-    prefill_values = [cache.layers[l].values[0].clone() for l in range(n_layers)]
+    # Sliding-window layers manage their own fixed window — never touch them.
+    # Only full-attention layers get hierarchical eviction.
+    full_attn = [l for l in range(n_layers)
+                 if not getattr(cache.layers[l], "is_sliding", False)]
 
-    # Derive actual shapes from the cache rather than the config
-    # (Laguna's head_dim != hidden_size // n_q_heads)
-    n_kv     = prefill_keys[0].size(0)   # [n_kv_heads, prefill_len, head_dim]
-    head_dim = prefill_keys[0].size(2)
+    # Immutable flat backing store for full-attention layers only
+    prefill_keys   = {l: cache.layers[l].keys[0].clone()   for l in full_attn}
+    prefill_values = {l: cache.layers[l].values[0].clone() for l in full_attn}
 
-    # ── Build inodes per layer ────────────────────────────────────────────
-    # Each layer's keys have different numerical values, so inodes are per-layer.
-    layer_leaf_inodes:  List[Dict[int, LeafInode]]  = []
-    layer_topic_inodes: List[Dict[int, TopicInode]] = []
-    for l in range(n_layers):
+    # Derive actual shapes from the cache (Laguna head_dim ≠ hidden_size // n_q)
+    n_kv     = next(iter(prefill_keys.values())).size(0)   # [n_kv, prefill_len, head_dim]
+    head_dim = next(iter(prefill_keys.values())).size(2)
+
+    # ── Build inodes for full-attention layers only ───────────────────────
+    layer_leaf_inodes:  Dict[int, Dict[int, LeafInode]]  = {}
+    layer_topic_inodes: Dict[int, Dict[int, TopicInode]] = {}
+    for l in full_attn:
         li, ti = build_inodes(tree, node_token_map, prefill_keys[l])
-        layer_leaf_inodes.append(li)
-        layer_topic_inodes.append(ti)
+        layer_leaf_inodes[l]  = li
+        layer_topic_inodes[l] = ti
 
-    # ── Active cache reconstruction ───────────────────────────────────────
+    # ── Active cache reconstruction (full-attention layers only) ──────────
     def reconstruct(l: int, query: torch.Tensor,
                     gen_k: torch.Tensor, gen_v: torch.Tensor):
-        """
-        Build the active cache for layer l:
-          1. Sink: first `sink` prefill positions — always included.
-          2. Quest: walk the AST to select prefill clusters.
-          3. Cap total prefill positions so recent_generated still fits in budget.
-          4. Append last `recent` generated tokens.
-        """
         budget_l     = layer_budgets[l]
         n_recent_gen = min(recent, gen_k.size(1))
 
@@ -360,7 +356,6 @@ def generate_with_hierarchy(
             k_leaves=k_leaves,
         )
 
-        # Union sink ∪ quest, trim to leave room for recent generated tokens
         prefill_pos = sorted(sink_pos | quest_pos)
         max_prefill = budget_l - n_recent_gen
         if len(prefill_pos) > max_prefill:
@@ -368,22 +363,21 @@ def generate_with_hierarchy(
             allowed     = max(0, max_prefill - len(sink_pos))
             prefill_pos = sorted(sink_pos | set(quest_only[:allowed]))
 
-        pk = prefill_keys[l][:,   prefill_pos, :]   # [n_kv, n_sel, head_dim]
+        pk = prefill_keys[l][:,   prefill_pos, :]
         pv = prefill_values[l][:, prefill_pos, :]
 
         if n_recent_gen > 0:
             pk = torch.cat([pk, gen_k[:, -n_recent_gen:, :]], dim=1)
             pv = torch.cat([pv, gen_v[:, -n_recent_gen:, :]], dim=1)
 
-        return pk.unsqueeze(0), pv.unsqueeze(0)     # [1, n_kv, active, head_dim]
+        return pk.unsqueeze(0), pv.unsqueeze(0)   # [1, n_kv, active, head_dim]
 
-    # ── Initialise active cache using prefill query ───────────────────────
-    gen_keys   = [torch.empty(n_kv, 0, head_dim, device=device,
-                              dtype=prefill_keys[0].dtype)
-                  for _ in range(n_layers)]
-    gen_values = [torch.empty_like(gen_keys[l]) for l in range(n_layers)]
+    # ── Initialise active cache for full-attention layers ─────────────────
+    gen_keys   = {l: torch.empty(n_kv, 0, head_dim, device=device,
+                                 dtype=prefill_keys[l].dtype) for l in full_attn}
+    gen_values = {l: torch.empty_like(gen_keys[l])             for l in full_attn}
 
-    for l in range(n_layers):
+    for l in full_attn:
         q = qcap.queries.get(l, prefill_keys[l][:, -1, :])
         cache.layers[l].keys, cache.layers[l].values = reconstruct(
             l, q, gen_keys[l], gen_values[l]
@@ -407,16 +401,16 @@ def generate_with_hierarchy(
             )
         current_pos += 1
 
-        # Accumulate the new token's K/V into the generated store
-        for l in range(n_layers):
+        # Accumulate new token K/V for full-attention layers only
+        for l in full_attn:
             gen_keys[l]   = torch.cat([gen_keys[l],
                                         cache.layers[l].keys[0, :, -1:, :]],   dim=1)
             gen_values[l] = torch.cat([gen_values[l],
                                         cache.layers[l].values[0, :, -1:, :]], dim=1)
 
-        # Every β steps: rebuild active cache from hierarchy selection
+        # Every β steps: rebuild full-attention layer caches
         if (step + 1) % beta == 0:
-            for l in range(n_layers):
+            for l in full_attn:
                 q = qcap.queries.get(l, prefill_keys[l][:, -1, :])
                 cache.layers[l].keys, cache.layers[l].values = reconstruct(
                     l, q, gen_keys[l], gen_values[l]
@@ -428,14 +422,15 @@ def generate_with_hierarchy(
     qcap.remove()
 
     return {
-        "sequences":       torch.cat(
-                               [input_ids, torch.tensor([generated], device=device)], dim=1
-                           ),
-        "generated_ids":   generated,
-        "final_kv_lens":   [cache.layers[l].get_seq_length() for l in range(n_layers)],
-        "layer_budgets":   layer_budgets,
-        "n_leaf_clusters": len(tree.leaf_clusters),
-        "n_topic_nodes":   len(tree.topic_nodes),
+        "sequences":        torch.cat(
+                                [input_ids, torch.tensor([generated], device=device)], dim=1
+                            ),
+        "generated_ids":    generated,
+        "final_kv_lens":    [cache.layers[l].get_seq_length() for l in range(n_layers)],
+        "layer_budgets":    layer_budgets,
+        "n_full_attn":      len(full_attn),
+        "n_leaf_clusters":  len(tree.leaf_clusters),
+        "n_topic_nodes":    len(tree.topic_nodes),
     }
 
 
