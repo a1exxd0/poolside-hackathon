@@ -95,20 +95,32 @@ def baseline_generate(input_ids: torch.Tensor, model, tokenizer, max_new_tokens:
     return response, elapsed
 
 
-def dynamic_prefill(
+
+
+def dynamic_generate(
     input_ids: torch.Tensor,
     model,
     tokenizer,
     method: str,
     cache: EmbeddingCache,
+    max_new_tokens: int = 64,
 ) -> tuple:
     """
-    Prefill the model using dynamically merged token embeddings.
+    Full dynamic-tokenization generation:
+      - Compress the prompt with FVT (Paper 1) guided by Paper 2 boundaries.
+      - Pass the merged inputs_embeds directly to model.generate().
 
-    Returns (past_key_values, merged_len, elapsed_prefill).
+    Passing inputs_embeds to generate() avoids past_key_values cache format
+    incompatibilities across transformers versions: the model handles prefill
+    and generation in one shot from the compressed embedding sequence.
+
+    Returns (response_text, original_len, merged_len, total_elapsed).
     """
-    # Step 1: detect boundaries (Paper 2)
+    original_len = input_ids.shape[0]
+
     t0 = time.perf_counter()
+
+    # Step 1: detect boundaries (Paper 2)
     boundaries = detect_boundaries(
         input_ids,
         method=method,
@@ -125,61 +137,20 @@ def dynamic_prefill(
     )
     merged_len = inputs_embeds.shape[0]
 
-    # Step 3: forward pass with merged embeddings to fill the KV cache
-    with torch.no_grad():
-        prefill_out = model(
-            inputs_embeds=inputs_embeds.unsqueeze(0),  # [1, S, D]
-            use_cache=True,
-            return_dict=True,
-        )
-    elapsed = time.perf_counter() - t0
-
-    return prefill_out.past_key_values, merged_len, elapsed
-
-
-def dynamic_generate(
-    input_ids: torch.Tensor,
-    model,
-    tokenizer,
-    method: str,
-    cache: EmbeddingCache,
-    max_new_tokens: int = 64,
-) -> tuple:
-    """
-    Full dynamic-tokenization generation:
-      - Compress the prompt with FVT (Paper 1) guided by Paper 2 boundaries.
-      - Seed generation with the compressed KV cache.
-      - Continue generating with standard token-by-token decoding.
-
-    Returns (response_text, original_len, merged_len, total_elapsed).
-    """
-    original_len = input_ids.shape[0]
-
-    # Compressed prefill
-    past_key_values, merged_len, prefill_time = dynamic_prefill(
-        input_ids, model, tokenizer, method, cache
-    )
-
-    # Generation seeded from the compressed KV cache.
-    # We need to supply the last token's input_ids so the model knows
-    # where to continue; use the actual last token from the original sequence.
-    last_token = input_ids[-1:].unsqueeze(0)  # [1, 1]
-
-    t0 = time.perf_counter()
+    # Step 3: generate directly from merged embeddings.
+    # model.generate() accepts inputs_embeds; it runs prefill + sampling
+    # in one pass so we avoid past_key_values handoff issues.
     with torch.no_grad():
         output_ids = model.generate(
-            last_token,
-            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds.unsqueeze(0),  # [1, S, D]
             max_new_tokens=max_new_tokens,
             do_sample=False,
         )
-    gen_time = time.perf_counter() - t0
 
-    # output_ids[0] starts after last_token; skip the first token (it echoes last_token)
-    new_tokens = output_ids[0][1:]
-    response = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    elapsed = time.perf_counter() - t0
+    response = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-    return response, original_len, merged_len, prefill_time + gen_time
+    return response, original_len, merged_len, elapsed
 
 
 # ---------------------------------------------------------------------------
