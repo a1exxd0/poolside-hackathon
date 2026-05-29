@@ -206,10 +206,9 @@ class _QueryCapture:
         self._handles = []
 
     def install(self, model):
-        cfg      = model.config
-        n_q      = cfg.num_attention_heads
-        n_kv     = getattr(cfg, "num_key_value_heads", n_q)
-        head_dim = cfg.hidden_size // n_q
+        cfg  = model.config
+        n_q  = cfg.num_attention_heads
+        n_kv = getattr(cfg, "num_key_value_heads", n_q)
 
         for l in range(cfg.num_hidden_layers):
             try:
@@ -217,16 +216,18 @@ class _QueryCapture:
             except AttributeError:
                 continue
 
-            def make_hook(li, nq, nkv, hd):
+            def make_hook(li, nq, nkv):
                 def hook(module, inp, output):
-                    q = output[0, -1].reshape(nq, hd)       # [n_q, head_dim]
+                    last = output[0, -1]                     # [n_q * head_dim]
+                    hd   = last.numel() // nq                # actual head_dim
+                    q    = last.reshape(nq, hd)              # [n_q, head_dim]
                     if nq != nkv:
                         q = q.reshape(nkv, nq // nkv, hd).mean(1)  # [n_kv, head_dim]
                     self.queries[li] = q.detach()
                 return hook
 
             self._handles.append(
-                q_proj.register_forward_hook(make_hook(l, n_q, n_kv, head_dim))
+                q_proj.register_forward_hook(make_hook(l, n_q, n_kv))
             )
 
     def remove(self):
@@ -288,9 +289,6 @@ def generate_with_hierarchy(
     device   = input_ids.device
     model.eval()
     n_layers = model.config.num_hidden_layers
-    n_kv     = getattr(model.config, "num_key_value_heads",
-                       model.config.num_attention_heads)
-    head_dim = model.config.hidden_size // model.config.num_attention_heads
 
     # PyramidKV: bottom layer gets 2×budget, top layer gets budget÷2
     b_min = max(sink + recent + 16, budget // 2)
@@ -323,6 +321,11 @@ def generate_with_hierarchy(
     # Immutable flat backing store: full prefill K/V, never modified
     prefill_keys   = [cache.key_cache[l][0].clone()   for l in range(n_layers)]
     prefill_values = [cache.value_cache[l][0].clone() for l in range(n_layers)]
+
+    # Derive actual shapes from the cache rather than the config
+    # (Laguna's head_dim != hidden_size // n_q_heads)
+    n_kv     = prefill_keys[0].size(0)   # [n_kv_heads, prefill_len, head_dim]
+    head_dim = prefill_keys[0].size(2)
 
     # ── Build inodes per layer ────────────────────────────────────────────
     # Each layer's keys have different numerical values, so inodes are per-layer.
