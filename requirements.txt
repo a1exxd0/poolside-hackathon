@@ -3,3 +3,8 @@ openai
 python-dotenv
 torch
 transformers
+hnswlib>=0.8.0
+sentence-transformers>=3.0.0
+python-louvain>=0.16
+scikit-learn>=1.4.0
+networkx>=3.0
