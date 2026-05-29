@@ -1,272 +1,169 @@
-# Page-Aligned 4-bit KV Cache with Blockwise Scaling
+# Page-Aligned 4-bit KV Cache: INT4 with Per-Channel-K (KIVI) Scaling
+
+*Validated on Laguna-XS.2. This doc supersedes an earlier draft that proposed an
+MSE-optimal clip search on vLLM's NVFP4 kernel; the sweep below shows that was
+the smallest of three levers. The real lever is the block **layout**.*
+
+## TL;DR
+
+vLLM's production 4-bit KV path is **NVFP4 (e2m1)** with a per-16-element block
+scale along `head_dim`, set by absmax. We swept *format × block-layout ×
+calibration* on real Laguna-XS.2 KV activations. The dominant lever is not the
+number format and not the calibration — it is the **block layout**:
+
+- Quantizing **K per-channel** (a 16-*token* block of one channel, à la KIVI)
+  with plain **uniform INT4** cuts K reconstruction error **~25%** vs the NVFP4
+  baseline, at identical memory.
+- That gain **grows with context**: neutral below 512 tokens, rising to a stable
+  **~20–25% KL reduction** (and ~1 pt top-1) beyond 1k tokens — the long-context
+  regime KV quantization exists for.
+- **INT3 is below the floor**: ~2–2.7× the distortion, getting worse with length.
+- **The catch**: per-channel blocking cannot use NVFP4's hardware microscale
+  (which decodes 16 *contiguous* = `head_dim` elements). Capturing this needs a
+  **software INT4 KV path**, trading Blackwell's native FP4 throughput for the
+  layout freedom that the quality win depends on.
 
 ## Problem
 
-vLLM's PagedAttention stores the KV cache in fixed-size contiguous pages
-(default 16 tokens per block). For quantization, vLLM's production path is
-**FP8 (e4m3) with a single per-tensor scale** (`k_scale` / `v_scale` per
-layer). This works because FP8 has 4 exponent bits — it carries real dynamic
-range, so one global scale plus the floating-point exponent adapts locally
-"for free."
+The KV cache dominates memory at long context / high batch, and decode attention
+is memory-bandwidth bound. vLLM's mature low-bit path is FP8 (1 B/elem). Going to
+**4-bit** (~0.56 B/elem incl. an 8-bit block scale, **3.56× vs BF16**) roughly
+doubles concurrent sequences or context per HBM byte and moves fewer bytes per
+attention read. A single global scale at 4-bit is a non-starter — K has known
+per-channel outliers that drag a global scale huge and collapse everything else —
+so any 4-bit KV scheme needs **blockwise** scaling. The question is *which* block
+geometry and *which* 4-bit format.
 
-The KV cache is the dominant memory consumer at long context / high batch,
-and at decode time attention is **memory-bandwidth bound**. We want to halve
-it again — go from FP8 (1 byte/elem) to **4-bit** (0.5 byte/elem), ~3.5× vs
-FP16 — to roughly double concurrent sequences (throughput) or context length
-in the same HBM, and move fewer bytes per attention read.
+## What vLLM already has (verified against upstream)
 
-**Why we can't just reuse the FP8 approach at 4 bits:**
+vLLM already ships a paged NVFP4 KV cache on Blackwell (SM100):
+`csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu`, page layout
+`[K_data | K_scale | V_data | V_scale]`, **16-element blocks along `head_dim`**,
+scales stored as **uint8** (e4m3), quantized via `cvt_warp_fp16_to_fp4` with
+`scale = absmax / 6.0`.
 
-INT4 has 16 evenly-spaced levels. NVFP4 (e2m1) has only 2 exponent bits — 16
-representable values with almost no dynamic range. With a **single global
-scale**, the scale must cover the largest magnitude in the entire tensor. KV
-caches have known outlier structure (a few K channels blow up). The global
-scale gets dragged huge by outliers, and the remaining ~99% of values collapse
-into 2–3 quantization levels. Reconstruction error explodes. **Single scale +
-4-bit is a non-starter** — this is dynamic-range math, not a tuning issue.
+Correction to the earlier draft: the kernel runs **once per token**
+(`token_idx = blockIdx.x; grid(num_tokens)`), not once per page. Each `head_dim`
+block is one token's 16 channels and is complete the moment that token is
+written — there is no page-fill event, and "wait for the page to fill" only makes
+sense for the *token-axis* (per-channel) blocking we propose below, not for the
+shipped `head_dim` blocking.
 
-## What vLLM Already Has
+## What we measured
 
-An important discovery: vLLM **already implements per-16-element blockwise
-scaling** for NVFP4 KV caches on Blackwell (SM100). The relevant kernel is
-`csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu`, dispatched from
-`cache_kernels.cu:774`. It stores pages in the layout `[K_data | K_scale |
-V_data | V_scale]` — scales contiguous with data, exactly the architecture
-this doc called for. The block size is 16 elements along `head_dim`, matching
-MXFP4.
+A Python harness (`kv_quant.py`) quantizes real Laguna-XS.2 K/V and sweeps
+`{nvfp4, int4, int3} × {headdim-block, per-channel-block} × {absmax, mse}`. Every
+4-bit cell costs identical memory; this isolates quality.
 
-The scale computation lives in
-`csrc/libtorch_stable/quantization/fp4/nvfp4_utils.cuh`, inside
-`cvt_warp_fp16_to_fp4`. The current line is:
+### Finding 1 — layout dominates (KEY cache)
 
-```c
-float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
-```
+Avg K-RMSE over 3 prompts (baseline = `nvfp4 / headdim / absmax`, what vLLM ships):
 
-That is: **absmax / 6.0** (NVFP4's representable maximum), scaled by a global
-per-layer calibration factor. This is the only part that needs to change.
+| format | layout | calib | K-RMSE | vs baseline |
+|--------|--------|-------|--------|-------------|
+| nvfp4  | headdim | absmax | 0.1075 | — |
+| int4   | headdim | absmax | 0.1141 | **−7%** (worse) |
+| nvfp4  | channel | absmax | 0.1172 | **−9%** (worse) |
+| **int4** | **channel** | **mse** | **0.0808** | **+25%** |
 
-**The gap is narrow and surgical:** the infrastructure — paged layout, coherent
-scale storage, warp-cooperative quantization, B300 native NVFP4 decode — is
-already in tree. The remaining work is replacing one absmax line with a
-clip-ratio grid search in the same warp-cooperative context.
+The win is a **non-additive synergy**: switching format alone (INT4, head_dim) is
+*worse*; switching layout alone (NVFP4, per-channel) is *worse*; only INT4 **and**
+per-channel together win (+19%), with MSE calibration adding the last ~5 pts.
+Mechanism: a per-channel block holds 16 tokens of *one* channel → near-uniform
+magnitude within the block → uniform INT4 is optimal and e2m1's non-uniform levels
+are wasted. K's outliers are per-channel, so this layout isolates them; the
+shipped `head_dim` block straddles 16 *different* channels and one outlier poisons
+the block.
 
-## Solution
+### Finding 2 — V is different (the KIVI asymmetry)
 
-Replace the absmax block scale with an **MSE-optimal clip-ratio scale**,
-computed once at page-fill time. The key insight: KV entries are **immutable
-once a page is written** — they are read thousands of times during decode but
-never changed. This lets us afford a richer calibration that is permanently
-amortized.
+V is well-behaved (no strong per-channel structure): INT4 beats NVFP4 regardless
+of layout, and per-token (`head_dim`) blocking is within ~2% of per-channel. So
+the design that falls out is exactly **KIVI**: **per-channel INT4 for K,
+per-token INT4 for V**.
 
-### Scale calibration: absmax vs MSE-optimal
+### Finding 3 — downstream: near-lossless short, win grows long
 
-Absmax sets `scale = max(|x|) / QMAX`. This over-weights the single largest
-element. For a block of 16 KV values with one outlier at 2× the typical
-magnitude, the outlier forces the scale to 2× what the remaining 15 values
-need, wasting roughly half the INT4 levels on the non-outlier elements.
+Teacher-forced KL(bf16‖scheme) and top-1 agreement vs a BF16 reference (identical
+context, no autoregressive drift):
 
-The fix is a **clip-ratio grid search**: for `α` in `{0.5, 0.53, …, 1.0}` (32
-steps), compute `scale = α · absmax / QMAX`, quantize, dequantize, measure
-MSE, pick the `α` with lowest MSE. The outlier gets clipped rather than
-respected, and the other 15 values get denser coverage. Cost: 32 scalar
-iterations per 16-element block, all in registers inside the warp that is
-already running.
+- **Short context (<1k tokens, production-faithful frozen-page protocol):** both
+  4-bit schemes are near-lossless. int4-kivi: top-1 **98.6% vs 98.5%** (tie),
+  KL **+10%**. Real but small — the model barely leans on a small cache.
+- **Long context (8k tokens, all-KV-quantized single-pass, 3 windows):** the gap
+  **grows with position** and stabilizes:
 
-This is a one-time cost per page fill, amortized over the full decode lifetime
-of that page. It is negligible relative to the memory bandwidth saved.
+  | position | int4-kivi KL reduction | top-1 (base → kivi) |
+  |----------|------------------------|---------------------|
+  | 0–512    | −2%  | 82.0 → 82.1% |
+  | 1024–2048 | +27% | 94.0 → 94.9% |
+  | 4096–8000 | **+20%** | **93.4 → 94.5%** |
 
-### Page alignment
+The advantage is neutral when the cache is tiny and rises to a stable ~20–25% KL
+reduction (≈17% fewer top-1 errors) once real long-range context accumulates.
+*Protocol caveat:* the single-pass test quantizes all K/V including each
+position's nearest tokens (no bf16 hot page), so absolute KL is inflated; the
+**trend and relative gap** are the signal. The true production number (with a
+bf16 hot page) sits between the short-context +10% and this +20–25%.
 
-The quant block boundary is already the page boundary in vLLM's layout. No
-new alignment logic is needed. Allocating a page continues to allocate its
-scales; freeing a page frees its scales. The block allocator is unchanged.
+### Finding 4 — 4-bit is the floor
 
-### Why fill-time calibration is correct
+INT3 (4.57× vs BF16) runs **~2–2.7× the baseline KL** and gets *relatively worse*
+with context (−112% at 4–8k). Per-channel layout helps it slightly but
+bit-starvation dominates. The extra 28% memory saving isn't worth it. Note: RMSE
+predicts the 4-bit layout win but mispredicts at INT3 — treat RMSE as a 4-bit
+screen only, and confirm low-bit downstream.
 
-The page fills exactly once — when the last of its 16 token slots is written.
-At that moment all values in the block are known, the calibration has full
-information, and the result never needs to be recomputed. This is the ideal
-calibration scenario: complete data, one-time cost, infinite reuse.
+## Why this needs a software INT4 path (the catch)
 
-## vLLM Implementation Plan
+NVFP4's hardware microscale decodes 16 **contiguous** elements = `head_dim`.
+Per-channel blocking is along the **token** axis — incompatible with the hardware
+format. In the `head_dim` layout the hardware forces, **NVFP4 ≥ INT4** (0.107 vs
+0.114); INT4 only wins *with* per-channel blocking, which requires a software
+dequant-to-BF16 read path (the same shape as today's FP8 KV path — store low-bit,
+dequant in the attention backend, attend in BF16). On Blackwell this gives up
+native FP4 throughput, but KV decode is bandwidth-bound, and INT4 dequant (an
+int→float multiply) is cheaper than e2m1 reconstruction.
 
-All changes are confined to two files. No Python changes. No allocator changes.
-No attention kernel changes.
+## Implementation sketch (if pursued)
 
-### 1. `csrc/libtorch_stable/quantization/fp4/nvfp4_utils.cuh`
+A software INT4 KV path, not an edit to the NVFP4 kernel:
 
-Add a warp-cooperative MSE-optimal scale function alongside the existing
-`cvt_warp_fp16_to_fp4`. The new function performs the grid search in registers
-across the warp that already owns the 16 input elements:
+1. **Layout:** K per-channel (16-token blocks), V per-token (`head_dim` blocks),
+   one INT4 + one 8-bit scale per block. Same scale count and memory as the
+   NVFP4 layout.
+2. **Fill:** quantize a K page when its 16 tokens complete (per-channel scale
+   needs the full page — *this* is where the "calibrate once at page fill"
+   argument is actually correct), keep the partial hot page in BF16. V quantizes
+   per token immediately.
+3. **Calibration:** MSE-optimal clip scale (small extra gain over absmax; cheap,
+   one-time per page).
+4. **Read:** dequant to BF16 in the attention backend; attention unchanged.
 
-```c
-template <class Type, int N_THREADS_PER_SF, int N_ALPHAS = 32>
-__device__ __forceinline__ float mse_optimal_sf(
-    PackedVec<Type, CVT_FP4_PACK16>& vec, float global_scale)
-{
-    // 1. Reduce absmax across the warp (identical to current code)
-    auto localMax = __habs2(vec.elts[0]);
-    for (int i = 1; i < CVT_FP4_ELTS_PER_THREAD / 2; i++)
-        localMax = __hmax2(localMax, __habs2(vec.elts[i]));
-    if constexpr (N_THREADS_PER_SF == 2)
-        localMax = __hmax2(__shfl_xor_sync(0xffffffffu, localMax, 1), localMax);
-    float absmax = float(__hmax(localMax.x, localMax.y));
+Prior art: **KIVI** (per-channel K, per-token V), **QServe** (W4A8KV4 on
+A100/H100) — INT4 KV is well-trodden off the NVFP4 hardware path.
 
-    // 2. Grid search over clip ratios — all in registers
-    float best_mse = 1e30f;
-    float best_scale = global_scale * absmax * reciprocal_approximate_ftz(6.0f);
-    constexpr float alpha_step = 0.5f / (N_ALPHAS - 1);
-
-    for (int k = 0; k < N_ALPHAS; k++) {
-        float alpha = 0.5f + k * alpha_step;
-        float cand_scale = global_scale * alpha * absmax
-                           * reciprocal_approximate_ftz(6.0f);
-        float mse = 0.0f;
-        // Accumulate squared error over this thread's elements
-        for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-            // quantize to e2m1 grid, dequantize, compute squared error
-            // (expand __half2 to two floats, clip, round, accumulate)
-            mse += /* squared error for 2 elements */ 0.0f;
-        }
-        if constexpr (N_THREADS_PER_SF == 2)
-            mse += __shfl_xor_sync(0xffffffffu, mse, 1);
-        if (mse < best_mse) { best_mse = mse; best_scale = cand_scale; }
-    }
-    return best_scale;
-}
-```
-
-### 2. `csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu`
-
-In `reshape_and_cache_nvfp4_kernel`, replace the single `cvt_warp_fp16_to_fp4`
-call with a two-step sequence: compute the MSE-optimal scale first, then pass
-it into a refactored quantization helper that accepts an externally computed
-scale:
-
-```c
-// Before
-fp4_packed_t packed = cvt_warp_fp16_to_fp4<CudaType, THREADS_PER_SF>(
-    in_vec, global_scale, sf_out_ptr);
-
-// After
-float opt_scale = mse_optimal_sf<CudaType, THREADS_PER_SF>(in_vec, global_scale);
-fp4_packed_t packed = cvt_warp_fp16_to_fp4_with_scale<CudaType, THREADS_PER_SF>(
-    in_vec, opt_scale, sf_out_ptr);
-```
-
-`cvt_warp_fp16_to_fp4_with_scale` is `cvt_warp_fp16_to_fp4` refactored to
-accept an externally computed scale instead of deriving it from absmax. The
-existing callers outside the KV cache path are unaffected.
-
-A compile-time flag (`VLLM_KV_MSE_SCALE`, default on for SM100) lets the old
-absmax path stay selectable for A/B benchmarking.
-
-### Caller and Python side
-
-No changes. `reshape_and_cache_nvfp4_dispatch` in `cache_kernels.cu`,
-`_custom_ops.py`, and all attention backends are unchanged. The MSE-optimal
-scale is an internal detail of the per-page fill kernel.
-
-## Empirical Validation (Laguna-XS.2)
-
-We implemented the Python equivalent (`kv_quant.py` in this repo) and measured
-on the real model to validate the approach before touching the CUDA kernel.
-
-### Memory reduction
-
-On a 360-token decode (40 layers, 8 KV heads, head_dim=128):
-
-| Format | Memory | Ratio vs BF16 |
-|--------|--------|---------------|
-| BF16 | 59.0 MB | 1.0× |
-| INT4 + FP16 block scales | 19.3 MB | **3.05×** |
-
-Theoretical ceiling is 3.56× (INT4 at 0.5 B/elem vs BF16 at 2 B/elem); the
-gap is the hot-page buffer (last partial page kept in BF16). At context lengths
-above a few hundred tokens the ratio stabilises toward 3.2×.
-
-### Scale quality
-
-Across all 40 layers, MSE-optimal calibration vs absmax on real Laguna-XS.2
-KV activations:
-
-| | Absmax | MSE-optimal | Improvement |
-|--|--------|-------------|-------------|
-| Avg key RMSE | 0.1142 | 0.1094 | **4.2%** |
-| Range (all layers) | 0.065–0.147 | 0.062–0.141 | 3–5% uniform |
-
-The improvement is modest but perfectly consistent across every layer — no
-outlier layers, no dataset-specific spikes. This uniformity confirms it is
-structural (better INT4 level utilisation) rather than coincidental.
-
-### Accuracy
-
-**HumanEval (first 20 problems):**
-
-| Mode | pass@1 | Agreement |
-|------|--------|-----------|
-| BF16 | 19/20 (95%) | — |
-| INT4-simulated | 19/20 (95%) | **20/20 (100%)** |
-
-Both modes fail on exactly one problem (`make_palindrome`, HumanEval/10),
-pass all others, and agree on every verdict. Quantization has zero measurable
-impact on code generation correctness at this context length.
-
-**Reasoning trace (200 tokens):**
-
-Token-level agreement between BF16 and INT4-simulated generation on a
-step-by-step math problem: **75%** (150/200 tokens), with an **identical
-prefix of 96 tokens**. After divergence both outputs reach the same answer via
-the same logical steps — the drift is surface phrasing, not reasoning.
-
-This is the worst-case measurement: the full accumulated cache is requantized
-at every single decode step. In production (calibrate once at page fill,
-dequantize on read) agreement will be higher.
-
-### Interpretation
-
-The data validates the theoretical argument. Blockwise INT4 with a
-per-16-element scale carries enough fidelity for attention computation to
-remain correct. The 4.2% RMSE improvement from MSE-optimal calibration is
-real but not the dominant factor — the primary benefit is the **3× memory
-reduction itself**, which directly enables 3× more concurrent sequences or 3×
-longer context in the same HBM budget.
-
-## Cost/Benefit
+## Cost / Benefit
 
 | Item | Value |
 |------|-------|
-| Memory vs BF16 | ~3× (measured), 3.56× theoretical |
-| Memory vs FP8 | ~1.78× (FP8 is 1 B/elem; INT4+scale is ~0.563 B/elem) |
-| RMSE improvement over absmax | 3–5% across all 40 Laguna layers |
-| HumanEval accuracy delta | 0 (no regression) |
-| Kernel change surface | Two functions in two files |
-| Python / allocator changes | None |
-| New CUDA ops | None (reuses existing warp quantization infrastructure) |
-| Calibration cost | 32 MACs per element in registers, once per page fill |
+| Memory vs BF16 | 3.56× (same as NVFP4; INT3 4.57× but below the floor) |
+| K reconstruction vs NVFP4 baseline | −25% RMSE (robust across prompts/lengths) |
+| Downstream KL vs NVFP4 baseline | +10% short ctx → ~+20–25% beyond 1k tokens |
+| Top-1 vs NVFP4 baseline | tie short ctx → +~1 pt (≈17% fewer errors) long ctx |
+| Cost | new software INT4 KV kernel + attention dequant; forgoes native FP4 MMA |
 
-## Objections
+## Honest caveats
 
-**Dequant cost in the attention kernel.** Unchanged from the existing NVFP4
-path. The scale is an FP8 value already in the same cache line as the data.
+Python simulation, not the kernel. One model (Laguna-XS.2). Long-context evidence
+is on code (in-distribution for a code model) over 3 windows; the single-pass
+protocol inflates absolute KL. Should be confirmed on natural-language / retrieval
+long-context tasks and, ultimately, in the kernel.
 
-**Calibration latency.** 32 iterations × 16 elements per warp = 512
-multiply-accumulates in registers at fill time. Rounding error vs writing the
-FP4 data. Can be made async on page completion if needed.
+## One-sentence summary
 
-**Accuracy regression.** Measured: zero on HumanEval, <1% surface drift on
-reasoning traces at short context. The 4.2% RMSE improvement over absmax
-further reduces residual risk at longer contexts.
-
-**Block shape for K outliers.** K outliers are per-channel. The 1×16 block
-layout along `head_dim` already used by the kernel is the right geometry —
-each block stays within one channel neighbourhood. No change needed.
-
-## One-Sentence Summary
-
-vLLM's NVFP4 KV cache already has paged blockwise scaling; the one remaining
-improvement is replacing the single absmax line in `nvfp4_utils.cuh` with a
-32-iteration MSE-optimal clip search, which our Python prototype on Laguna-XS.2
-confirms delivers 3× memory reduction with zero measured accuracy regression on
-HumanEval and correct reasoning on a 360-token trace.
+The lever for 4-bit KV is the block **layout**, not the number format: uniform
+INT4 with **per-channel-K (KIVI)** blocking beats vLLM's NVFP4 baseline by ~25% K
+reconstruction and a long-context-growing ~20–25% KL reduction at identical
+memory — but it lives off the NVFP4 hardware path, so it costs a software INT4 KV
+kernel; INT3 is below the quality floor.

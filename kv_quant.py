@@ -191,3 +191,131 @@ def measure_page_error(k: Tensor, page_size: int = PAGE, n_alphas: int = 32) -> 
         "optimal_mse": optimal_mse,
         "reduction_pct": 100.0 * (absmax_mse - optimal_mse) / max(absmax_mse, 1e-12),
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# INT4-vs-NVFP4 sweep:  {format} × {layout} × {calibration}
+#
+# Every cell costs the same memory (4-bit data + one scale per 16 elements =
+# 0.5625 B/elem), so this isolates reconstruction *quality*. Scales are kept in
+# fp32 here so neither format gets a scale-precision edge; realistic 1-byte
+# block scales would add the same small penalty to every cell.
+# ════════════════════════════════════════════════════════════════════════════
+
+# e2m1 (NVFP4) representable magnitudes, and midpoints used to round onto them.
+_E2M1_LEVELS = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+_E2M1_BOUNDS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+
+
+def _q_int4(y: Tensor) -> Tensor:
+    """Round scale-normalised values onto the symmetric INT4 grid [-7, 7]."""
+    return y.round().clamp(-7.0, 7.0)
+
+
+def _q_int3(y: Tensor) -> Tensor:
+    """Round scale-normalised values onto the symmetric INT3 grid [-3, 3]."""
+    return y.round().clamp(-3.0, 3.0)
+
+
+def _q_e2m1(y: Tensor) -> Tensor:
+    """Round scale-normalised values onto the e2m1 (NVFP4) grid, max magnitude 6."""
+    levels = _E2M1_LEVELS.to(y.device, y.dtype)
+    bounds = _E2M1_BOUNDS.to(y.device, y.dtype)
+    idx = torch.bucketize(y.abs(), bounds, right=False)
+    return torch.sign(y) * levels[idx]
+
+
+# format -> (qmax used to set the scale, rounding fn onto the grid)
+_FORMATS = {"int4": (7.0, _q_int4), "int3": (3.0, _q_int3), "nvfp4": (6.0, _q_e2m1)}
+
+
+def _to_blocks(x: Tensor, layout: str) -> Tensor:
+    """x [H, S, D] -> blocks [..., BLOCK].
+
+    'headdim' groups 16 channels of one token (what the NVFP4 kernel does);
+    'channel' groups 16 tokens of one channel (per-channel, KIVI-style).
+    'channel' requires S % BLOCK == 0.
+    """
+    H, S, D = x.shape
+    if layout == "headdim":
+        return x.reshape(H, S, D // BLOCK, BLOCK)
+    if layout == "channel":
+        return x.transpose(1, 2).contiguous().reshape(H, D, S // BLOCK, BLOCK)
+    raise ValueError(f"unknown layout {layout!r}")
+
+
+def _calibrate(xb: Tensor, qmax: float, qfn, calib: str, n_alphas: int = 32) -> Tensor:
+    """Per-block scale for blocks xb [..., BLOCK]. Returns [..., 1].
+
+    'mse' grid-searches the clip ratio alpha in [0.5, 1.0]; alpha=1.0 reproduces
+    absmax, so mse is <= absmax by construction.
+    """
+    xf = xb.float()
+    absmax = xf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-9)
+    if calib == "absmax":
+        return absmax / qmax
+    if calib != "mse":
+        raise ValueError(f"unknown calib {calib!r}")
+    alphas = torch.linspace(0.5, 1.0, n_alphas, device=xb.device).view(
+        (n_alphas,) + (1,) * xf.dim())
+    scales = alphas * absmax.unsqueeze(0) / qmax              # [n_alphas, ..., 1]
+    xexp = xf.unsqueeze(0)
+    err = ((xexp - qfn(xexp / scales) * scales) ** 2).mean(dim=-1, keepdim=True)
+    best = err.argmin(dim=0)                                  # [..., 1]
+    sflat = scales.reshape(n_alphas, -1).T                    # [num_blocks, n_alphas]
+    return sflat.gather(1, best.reshape(-1, 1)).reshape(*xb.shape[:-1], 1)
+
+
+def rmse_cell(x: Tensor, fmt: str, layout: str, calib: str, n_alphas: int = 32) -> float:
+    """Reconstruction RMSE for one (format, layout, calib) cell. x: [H, S, D]."""
+    qmax, qfn = _FORMATS[fmt]
+    xb = _to_blocks(x, layout).float()
+    scale = _calibrate(xb, qmax, qfn, calib, n_alphas)
+    xhat = qfn(xb / scale) * scale
+    return ((xb - xhat) ** 2).mean().sqrt().item()
+
+
+SWEEP_CELLS = [
+    (fmt, layout, calib)
+    for fmt in ("nvfp4", "int4")
+    for layout in ("headdim", "channel")
+    for calib in ("absmax", "mse")
+]
+# What vLLM's NVFP4 KV kernel ships today: NVFP4, head_dim blocks, absmax scale.
+SWEEP_BASELINE = ("nvfp4", "headdim", "absmax")
+
+
+def sweep_tensor(x: Tensor, n_alphas: int = 32) -> dict:
+    """Full {format}×{layout}×{calib} grid on x [H, S, D]; RMSE per cell.
+
+    Crops the sequence to a multiple of BLOCK so head_dim and channel layouts
+    are scored on identical data.
+    """
+    S = x.shape[1]
+    x = x[:, : (S // BLOCK) * BLOCK]
+    return {cell: rmse_cell(x, *cell, n_alphas=n_alphas) for cell in SWEEP_CELLS}
+
+
+def roundtrip(x: Tensor, fmt: str, layout: str, calib: str, n_alphas: int = 32) -> Tensor:
+    """Quantize+dequantize x [H, S, D] under one scheme; same shape and dtype out.
+
+    'headdim' quantizes every token immediately. 'channel' needs a full 16-token
+    page per scale, so the trailing S % BLOCK tokens are returned unquantized —
+    the realistic bf16 hot-page residual that per-channel blocking always carries.
+    """
+    qmax, qfn = _FORMATS[fmt]
+    H, S, D = x.shape
+    if layout == "headdim":
+        xb = _to_blocks(x, "headdim").float()
+        scale = _calibrate(xb, qmax, qfn, calib, n_alphas)
+        return (qfn(xb / scale) * scale).reshape(H, S, D).to(x.dtype)
+    if layout == "channel":
+        n_full = (S // BLOCK) * BLOCK
+        if n_full == 0:
+            return x
+        xb = _to_blocks(x[:, :n_full], "channel").float()     # [H, D, n_full//B, B]
+        scale = _calibrate(xb, qmax, qfn, calib, n_alphas)
+        head = (qfn(xb / scale) * scale).reshape(H, D, n_full).transpose(1, 2)
+        head = head.contiguous().to(x.dtype)
+        return torch.cat([head, x[:, n_full:]], dim=1) if n_full < S else head
+    raise ValueError(f"unknown layout {layout!r}")
