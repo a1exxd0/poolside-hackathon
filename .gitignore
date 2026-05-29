@@ -7,3 +7,5 @@ __pycache__/
 # calibration artifacts
 *.pt
 *.calib
+# claude code worktrees
+.claude/

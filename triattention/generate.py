@@ -26,10 +26,15 @@ from .scoring import default_offsets, score_keys
 @dataclasses.dataclass
 class GenerationResult:
     sequences: torch.Tensor          # [1, prompt + generated]
-    peak_kv_len: int                 # max keys stored in any layer during decoding
+    peak_kv_len: int                 # max keys stored in a compressed (full-attention) layer
     final_kv_len: int
     num_generated: int
     num_compressions: int
+    # Per-decode-step KV memory high-water (bytes, post-append/pre-compression), split
+    # by layer kind. Populated only when ``record_kv=True``.
+    kv_bytes_full: list[int] = dataclasses.field(default_factory=list)
+    kv_bytes_sliding: list[int] = dataclasses.field(default_factory=list)
+    kv_bytes_total: list[int] = dataclasses.field(default_factory=list)
 
 
 def _compress_layer(layer, scores: torch.Tensor, budget: int, sink: int) -> None:
@@ -64,6 +69,7 @@ def generate(
     sink: int = 4,
     compress: bool = True,
     eos_token_id: int | None = None,
+    record_kv: bool = False,
 ) -> GenerationResult:
     """Greedy-decode with optional TriAttention KV compression.
 
@@ -76,11 +82,24 @@ def generate(
 
     device = input_ids.device
     offsets = default_offsets(device) if compress else None
-    cache = DynamicCache()
+    # Config-aware cache: with mixed attention this gives sliding layers their own
+    # window-bounded layer type, so only the full-attention layers grow unbounded.
+    cache = DynamicCache(config=model.config)
     L = input_ids.shape[1]
 
+    # Map model-layer-index -> stats for the layers we compress (the full-attention ones).
+    stat_for = {}
+    if compress:
+        stat_for = {li: st for li, st in zip(stats.layer_indices, stats.layers)}
+    track = sorted(stat_for) or list(range(len(cache.layers)))   # layers to measure peak on
+
+    def _pos(start, n):
+        p = torch.arange(start, start + n, device=device)
+        return p, p.unsqueeze(0)
+
+    cache_pos, pos_ids = _pos(0, L)
     out = model(input_ids=input_ids, past_key_values=cache, use_cache=True,
-                cache_position=torch.arange(L, device=device))
+                cache_position=cache_pos, position_ids=pos_ids)
     abs_pos = L
     next_tok = out.logits[:, -1].argmax(-1, keepdim=True)
     generated = [next_tok]
@@ -88,25 +107,49 @@ def generate(
     peak_kv = L
     n_compress = 0
     eos = eos_token_id if eos_token_id is not None else getattr(model.config, "eos_token_id", None)
+    eos_set = set(eos) if isinstance(eos, (list, tuple)) else ({eos} if eos is not None else set())
+
+    # KV-memory bookkeeping: split layers by kind and size one key/value entry.
+    series_full, series_slid, series_tot = [], [], []
+    if record_kv:
+        lt = getattr(model.config, "layer_types", None) or ["full_attention"] * len(cache.layers)
+        full_idx = [i for i, t in enumerate(lt) if t == "full_attention"]
+        slid_idx = [i for i, t in enumerate(lt) if t != "full_attention"]
+        n_kv = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
+        hd = getattr(model.config, "head_dim", None) or \
+            model.config.hidden_size // model.config.num_attention_heads
+        itemsize = next(model.parameters()).element_size()
+        bytes_per_key = 2 * n_kv * hd * itemsize        # keys + values
+
+        def _record():
+            f = sum(cache.layers[i].keys.shape[-2] for i in full_idx)
+            s = sum(cache.layers[i].keys.shape[-2] for i in slid_idx)
+            series_full.append(f * bytes_per_key)
+            series_slid.append(s * bytes_per_key)
+            series_tot.append((f + s) * bytes_per_key)
 
     for step in range(1, max_new_tokens):
+        cache_pos, pos_ids = _pos(abs_pos, 1)
         out = model(input_ids=next_tok, past_key_values=cache, use_cache=True,
-                    cache_position=torch.tensor([abs_pos], device=device))
+                    cache_position=cache_pos, position_ids=pos_ids)
         abs_pos += 1
         next_tok = out.logits[:, -1].argmax(-1, keepdim=True)
         generated.append(next_tok)
 
-        cur_len = cache.layers[0].keys.shape[-2]
+        cur_len = max(cache.layers[li].keys.shape[-2] for li in track)
         peak_kv = max(peak_kv, cur_len)
-        if eos is not None and next_tok.item() == eos:
+        if record_kv:
+            _record()                                   # post-append high-water for this step
+        if next_tok.item() in eos_set:
             break
 
         if compress and step % beta == 0:
-            for li, layer in enumerate(cache.layers):
+            for li, st in stat_for.items():
+                layer = cache.layers[li]
                 keys = layer.keys[0]                    # [n_kv, S, d] post-RoPE
                 if keys.shape[1] <= budget:
                     continue
-                scores = score_keys(keys, abs_pos + 1, stats.layers[li],
+                scores = score_keys(keys, abs_pos + 1, st,
                                     group_size=stats.group_size, offsets=offsets)
                 _compress_layer(layer, scores, budget, sink)
             n_compress += 1
@@ -115,7 +158,10 @@ def generate(
     return GenerationResult(
         sequences=seq,
         peak_kv_len=peak_kv,
-        final_kv_len=cache.layers[0].keys.shape[-2],
+        final_kv_len=max(cache.layers[li].keys.shape[-2] for li in track),
         num_generated=len(generated),
         num_compressions=n_compress,
+        kv_bytes_full=series_full,
+        kv_bytes_sliding=series_slid,
+        kv_bytes_total=series_tot,
     )

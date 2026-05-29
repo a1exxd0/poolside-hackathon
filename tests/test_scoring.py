@@ -55,6 +55,39 @@ def test_trig_score_correlates_with_true_attention_over_positions():
     assert r > 0.99
 
 
+def _apply_partial_rope(x: torch.Tensor, pos: int, rotary_dim: int) -> torch.Tensor:
+    """RoPE that rotates only the first ``rotary_dim`` dims (Laguna partial-RoPE)."""
+    rot = apply_rope(x[..., :rotary_dim], pos)
+    return torch.cat([rot, x[..., rotary_dim:]], dim=-1)
+
+
+def test_partial_rope_trig_plus_pass_reconstructs_logit():
+    """With partial RoPE, S_trig (rotated bands) + S_pass (static tail) must
+    reconstruct the true attention logit — the Laguna code path."""
+    torch.manual_seed(1)
+    d, r = 16, 8                                           # rotary_dim 8, 8 pass-through dims
+    q, k = torch.randn(d), torch.randn(d)
+    pq, pk = 33, 5
+
+    omega = rope_frequencies(r)
+    Eq = to_complex_bands(q, r).view(1, -1)               # [1, r/2]
+    d2 = r // 2
+    stats = LayerStats(
+        omega=omega, Eq=Eq, Eq_norm=Eq.abs(),
+        R=torch.ones(1, d2),                              # R=1 -> S_norm = 0
+        Ek_norm=Eq.abs().clone(),
+        dominant_bands=torch.arange(d2).view(1, -1),      # all rotated bands
+        Eq_pass=q[r:].view(1, -1),                        # query pass-through = q tail
+        rotary_dim=r,
+    )
+    keys_post = _apply_partial_rope(k, pk, r).view(1, 1, d)
+
+    score = per_head_scores(keys_post, query_pos=pq, stats=stats,
+                            group_size=1, offsets=torch.tensor([0.0]))
+    true_logit = (_apply_partial_rope(q, pq, r) * _apply_partial_rope(k, pk, r)).sum()
+    assert torch.allclose(score.view(()), true_logit, atol=1e-2)
+
+
 def test_score_keys_gqa_shapes_and_finiteness():
     torch.manual_seed(4)
     d, n_q, n_kv, S = 32, 4, 2, 17

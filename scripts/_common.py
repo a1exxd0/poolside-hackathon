@@ -20,8 +20,8 @@ def pick_device() -> str:
 
 def load_model(model_name: str = DEFAULT_MODEL, device: str | None = None, dtype=torch.float16):
     device = device or pick_device()
-    tok = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype)
+    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, trust_remote_code=True)
     model.to(device).eval()
     return model, tok, device
 

@@ -26,7 +26,7 @@ from __future__ import annotations
 import torch
 
 from .calibration import LayerStats
-from .rope import to_complex_bands
+from .rope import to_complex_bands, pass_through_dims
 
 
 def default_offsets(device=None) -> torch.Tensor:
@@ -57,6 +57,8 @@ def per_head_scores(
     n_q = stats.Eq.shape[0]
     K = stats.dominant_bands.shape[1]
     dom = stats.dominant_bands                              # [n_q, K]
+    rotary_dim = getattr(stats, "rotary_dim", None) or d
+    kv_for_q = torch.arange(n_q, device=device) // group_size      # [n_q]
 
     # --- query-side gathered quantities (per query head, dominant bands) ---
     Eq_mag = stats.Eq.abs().gather(1, dom)                 # [n_q, K]
@@ -66,10 +68,9 @@ def per_head_scores(
     omega = stats.omega.unsqueeze(0).expand(n_q, -1).gather(1, dom)  # [n_q, K]
 
     # --- key-side gathered quantities (per query head's kv head, dominant bands) ---
-    kbands = to_complex_bands(keys_post)                   # [n_kv, S, d2] complex
+    kbands = to_complex_bands(keys_post, rotary_dim)       # [n_kv, S, d2] complex
     kmag = kbands.abs()                                    # [n_kv, S, d2]
     karg = kbands.angle()
-    kv_for_q = torch.arange(n_q, device=device) // group_size      # [n_q]
     kmag_q = kmag[kv_for_q]                                # [n_q, S, d2]
     karg_q = karg[kv_for_q]
     dom_S = dom.unsqueeze(1).expand(n_q, S, K)
@@ -87,6 +88,15 @@ def per_head_scores(
 
     # --- norm score (position-independent) ---
     s_norm = ((1.0 - R).view(n_q, 1, K) * Eq_norm.view(n_q, 1, K) * kmag_sel).sum(-1)  # [n_q, S]
+
+    # --- pass-through score: non-rotated dims contribute a static dot product
+    #     sum_{d in pass} E[q_d] * k_d  (position-independent, partial-RoPE only) ---
+    Eq_pass = getattr(stats, "Eq_pass", None)
+    if Eq_pass is not None and Eq_pass.numel():
+        kpass = pass_through_dims(keys_post, rotary_dim).float()     # [n_kv, S, n_pass]
+        kpass_q = kpass[kv_for_q]                                    # [n_q, S, n_pass]
+        s_pass = (Eq_pass.unsqueeze(1) * kpass_q).sum(-1)           # [n_q, S]
+        return s_trig + s_norm + s_pass
 
     return s_trig + s_norm                                 # [n_q, S]
 

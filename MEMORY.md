@@ -1,54 +1,49 @@
-# Project memory — TriAttention implementation
+# Project memory — TriAttention on Laguna-XS.2
 
-> Handoff notes for whoever picks this up (e.g. on the GPU node). Mirrors the working memory
-> from the dev session that created this repo.
+**Goal:** Implement arXiv:2604.04921v1 *"TriAttention: Efficient Long Reasoning with Trigonometric
+KV Compression"* and run it on **`poolside/Laguna-XS.2`** (~63 GB). KV-cache eviction (not a new
+model): every β tokens prune each full-attention layer to budget B (sink tokens + top-B by
+importance). Paper claims 2.5× throughput / 10.7× KV-mem at matched accuracy (AIME25 40.8%,
+MATH500 68.4%).
 
-**Goal:** Implement arXiv:2604.04921v1 — *"TriAttention: Efficient Long Reasoning with
-Trigonometric KV Compression"* — to optimize inference for the **LagunaXS.2** model (80 GB
-unquantized). Weights come from a **Hugging Face repo** (ID not yet provided). Real benchmark
-run is planned on a **rented cloud A100 80 GB** ("the other node").
+## Method (one-liner)
+Q/K concentrate in pre-RoPE space. Score a key's future importance with a trig series + norm term,
+read directly off cached post-RoPE keys (RoPE preserves `|k_f|`, folds position into the angle).
+GQA: z-score per query head, max over group. Dominant bands = top-K by `E|q_f|·E|k_f|`.
 
-## Hardware reality
-- Original dev machine: Apple M3 Pro, **18 GB unified RAM**, no CUDA — CANNOT hold the 80 GB
-  model (even INT4 ≈ 20-24 GB exceeds 18 GB total). Used only for building + small-model validation.
-- Local env: `uv` project, **Python 3.12** venv (torch lacks 3.14 wheels), torch 2.12 + MPS
-  working, transformers 5.9. On a CUDA node, `uv sync` pulls the CUDA torch wheel.
+## Environment (A100-80GB node, CUDA 13)
+`uv` at `~/.local/bin` (export PATH). `uv sync` → **py3.14** venv, torch 2.12+cu130, transformers 5.9.
+`uv run pytest -q` → **10 pass**. transformers 5.9 gotcha: `apply_chat_template` returns a dict —
+pass `return_dict=False`.
 
-## What TriAttention does (paper findings)
-- KV-cache **eviction** method (not a new model). Every β=128 generated tokens, prune cache to
-  budget B (default 2048; 512 for shorter seqs), keeping top-B keys by importance + sink tokens.
-- Key insight: Q/K **concentrate in pre-RoPE space** around stable complex centres. Score a key's
-  future importance via a trig series + norm term:
-  - `S_trig(k) = mean_{δ∈D} Σ_f |E[q_f]|·|k_f|·cos(ω_f(p_q+δ) + arg E[q_f] − arg k_f)`,  D={2^0..2^16}
-  - `S_norm(k) = Σ_f (1−R_f)·E[|q_f|]·|k_f|`,  R_f = |E[q_f]| / E[|q_f|]  (mean resultant length)
-  - GQA: z-score each query head's scores, max across the group → per-(kv-head, key) score.
-  - Dominant bands: pick top-K (K=2) by C_f = E[|q_f|]·E[|k_f|].
-- Claims: 2.5× throughput OR 10.7× KV-mem reduction at matched accuracy (AIME25 40.8%, MATH500 68.4%).
-- Eval on A100 80 GB; 24 GB RTX 4090 feasible with INT4.
+## Code map (`triattention/`)
+- `rope.py` — complex bands; `to_complex_bands(x, rotary_dim)` handles partial RoPE + `pass_through_dims`.
+- `calibration.py` — hooks `q_norm`/`k_norm` (Laguna's true pre-RoPE point), per-layer head counts,
+  reads model's real YaRN `inv_freq`, captures `Eq_pass`; calibrates **only full-attention layers**
+  (`CalibrationStats.layer_indices`). Falls back to q_proj/k_proj for Qwen2.
+- `scoring.py` — trig score on rotated bands + position-independent pass-through term `S_pass`.
+- `generate.py` — `DynamicCache(config=...)` auto-bounds the 30 sliding layers; compresses only the
+  10 full layers; explicit `position_ids` (Laguna desyncs otherwise); list EOS; `record_kv=` gives
+  per-step KV-byte series (split full/sliding/total).
+- Scripts: `validate_local.py` (Qwen2-1.5B), `validate_laguna.py`, `sweep_laguna.py`,
+  `benchmark_math.py` (MATH-500: random subset, transcripts + KV-mem percentiles → `results/*.json`).
 
-## Key implementation insight (important)
-RoPE is a per-band rotation that **preserves magnitude** and adds `p_k·ω_f` to the band angle.
-So `|k_f|` and the position term can be read straight from **cached post-RoPE keys** — scoring
-needs NO separate key-position tracking, only the current query's absolute position. The trig
-score rewrites to `cos(ω_f·p_q + arg E[q_f] − arg k_postRoPE_f)`. Verified by unit tests
-(reconstructs true attention logits at r>0.99).
+## Laguna-XS.2 facts (why it's not vanilla Qwen2)
+40 layers; full-attention at idx 0,4,…,36 (10 layers, 48 q-heads, GQA group 6); 30 sliding (window
+512, auto-capped by cache). head_dim 128, kv_heads 8. **Partial RoPE 0.5** (32 rotated bands + 64
+pass-through). **YaRN** on full layers. q_norm/k_norm before RoPE. MoE (256 exp) — irrelevant to KV.
 
-## Current state (DONE)
-- Package `triattention/`: `rope.py` (complex bands), `calibration.py` (pre-RoPE Q/K capture via
-  q_proj/k_proj forward hooks + stats), `scoring.py` (`per_head_scores`, `score_keys`),
-  `generate.py` (`_compress_layer` per-kv-head top-B eviction + manual greedy decode loop that
-  passes explicit `cache_position` so eviction can't desync RoPE).
-- Tests `tests/` (9 passing): RoPE invariants, logit decomposition, trig-score reconstruction,
-  GQA shapes, eviction (sink + top-scored retained, values evicted in lockstep).
-- Scripts: `scripts/_common.py` (model loader; local val model = DeepSeek-R1-Distill-Qwen-1.5B,
-  Qwen2 GQA 12q/2kv), `scripts/validate_local.py` (calibrate → baseline vs compressed generate).
+## Validated results
+- Qwen2-1.5B: fidelity scales with budget (budget 384 → 96.2% token agreement).
+- **Laguna-XS.2** (√2/Pell prompt, 700 tok): R=0.663. Full-KV peak 811 → 640 (1.27×)/320 (2.53×)/
+  192 (4.22×) at budget 512/256/128; transcripts coherent at every budget. peak = budget+β (cache
+  regrows between prunes). Load ~2:47, ~84 s/700-tok decode.
 
-## NOT done / next steps
-1. **Never ran** `validate_local.py` end-to-end (stopped before model download to move to the GPU
-   node). First action on the node: `uv sync && uv run pytest -q`, then
-   `uv run python -m scripts.validate_local`.
-2. Phase 4 (BLOCKED): need **HF repo ID for LagunaXS.2** + A100 access. Then provisioning script,
-   real-model calibration, AIME25/MATH500 benchmarks. Needs CUDA torch wheels on the node.
-3. Decoder assumes Llama/Qwen2 layout (`model.model.layers[i].self_attn.{q_proj,k_proj}`,
-   rotate_half RoPE, full attention). Verify LagunaXS.2 matches or adapt the capture hooks.
-4. Only greedy decoding implemented; batch size 1.
+## In progress / next
+- **MATH-500 benchmark** running: 5 random problems, configs baseline/b2048/b512/b256, max_new 2048,
+  full transcripts + p50/p90/p99 KV-mem → `results/`.
+- **b2048 never fires on MATH**: prompt+gen stays < 2048 tokens, so the `keys<=budget` guard skips
+  every layer → b2048 ≡ baseline. Needs AIME-length generations to engage; the benchmark prints
+  per-problem `peak_full_kv` to show the gap.
+- Not done: AIME25; throughput timing; greedy/bs=1 only. g_proj gate correctly ignored (scales
+  output, not key importance).

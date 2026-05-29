@@ -45,7 +45,8 @@ def main():
           f"R={stats.layers[0].R.mean():.3f} (mean concentration), took {time.time()-t0:.1f}s")
 
     msgs = [{"role": "user", "content": PROMPT}]
-    input_ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt").to(device)
+    input_ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt",
+                                         return_dict=False).to(device)
     print(f"[prompt] {input_ids.shape[1]} tokens")
 
     t0 = time.time()

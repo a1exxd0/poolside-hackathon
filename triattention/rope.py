@@ -33,16 +33,28 @@ def rope_frequencies(head_dim: int, theta: float = 10000.0, *, device=None, dtyp
     return theta ** (-f / head_dim)
 
 
-def to_complex_bands(x: torch.Tensor) -> torch.Tensor:
-    """Map a real head tensor ``[..., d]`` to complex bands ``[..., d/2]``.
+def to_complex_bands(x: torch.Tensor, rotary_dim: int | None = None) -> torch.Tensor:
+    """Map a real head tensor ``[..., d]`` to complex bands ``[..., r/2]``.
 
-    Uses the rotate_half pairing ``z_f = x[f] + i * x[f + d/2]`` so that a RoPE
+    Uses the rotate_half pairing ``z_f = x[f] + i * x[f + r/2]`` so that a RoPE
     rotation of ``x`` corresponds to multiplying ``z`` by ``exp(i * p * omega)``.
+
+    With **partial RoPE** (``rotary_dim < d``, e.g. Laguna's 0.5 factor) only the
+    first ``rotary_dim`` dims are rotated; the trailing ``d - rotary_dim`` dims pass
+    through unchanged. We form bands from the rotated block only — the pairing is
+    ``(f, f + rotary_dim/2)`` for ``f in [0, rotary_dim/2)``. Pass-through dims are
+    handled separately by the scorer (see :func:`pass_through_dims`).
     """
     d = x.shape[-1]
-    if d % 2 != 0:
-        raise ValueError(f"last dim must be even, got {d}")
-    half = d // 2
+    r = d if rotary_dim is None else rotary_dim
+    if r % 2 != 0:
+        raise ValueError(f"rotary_dim must be even, got {r}")
+    half = r // 2
     real = x[..., :half]
-    imag = x[..., half:]
+    imag = x[..., half:r]
     return torch.complex(real.float(), imag.float())
+
+
+def pass_through_dims(x: torch.Tensor, rotary_dim: int) -> torch.Tensor:
+    """Return the non-rotated (position-independent) tail ``x[..., rotary_dim:]``."""
+    return x[..., rotary_dim:]
