@@ -15,3 +15,6 @@ dependencies = [
 dev = [
     "pytest>=9.0.3",
 ]
+
+[tool.setuptools]
+packages = ["triattention"]

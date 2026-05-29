@@ -35,6 +35,9 @@ class GenerationResult:
     kv_bytes_full: list[int] = dataclasses.field(default_factory=list)
     kv_bytes_sliding: list[int] = dataclasses.field(default_factory=list)
     kv_bytes_total: list[int] = dataclasses.field(default_factory=list)
+    # Per-step quantized KV memory (populated when ``quant_cache=True``).
+    kv_quant_bytes: list[int] = dataclasses.field(default_factory=list)
+    kv_bf16_bytes: list[int] = dataclasses.field(default_factory=list)
 
 
 def _compress_layer(layer, scores: torch.Tensor, budget: int, sink: int) -> None:
@@ -70,6 +73,7 @@ def generate(
     compress: bool = True,
     eos_token_id: int | None = None,
     record_kv: bool = False,
+    quant_cache: bool = False,
 ) -> GenerationResult:
     """Greedy-decode with optional TriAttention KV compression.
 
@@ -86,6 +90,11 @@ def generate(
     # window-bounded layer type, so only the full-attention layers grow unbounded.
     cache = DynamicCache(config=model.config)
     L = input_ids.shape[1]
+
+    if quant_cache:
+        from .kv_quant import QuantizedKVCache
+        qcache = QuantizedKVCache()
+        quant_prev_len = 0
 
     # Map model-layer-index -> stats for the layers we compress (the full-attention ones).
     stat_for = {}
@@ -104,6 +113,16 @@ def generate(
     next_tok = out.logits[:, -1].argmax(-1, keepdim=True)
     generated = [next_tok]
 
+    if quant_cache:
+        # Prefill: all L tokens are new for every layer.
+        for li in range(len(cache.layers)):
+            k = cache.layers[li].keys[0]    # [n_kv, total, d]
+            v = cache.layers[li].values[0]  # [n_kv, total, d]
+            new_k = k[:, quant_prev_len:].unsqueeze(0)   # [1, n_kv, L, d]
+            new_v = v[:, quant_prev_len:].unsqueeze(0)
+            qcache.update(li, new_k, new_v)
+        quant_prev_len = max(cache.layers[li].keys.shape[-2] for li in range(len(cache.layers)))
+
     peak_kv = L
     n_compress = 0
     eos = eos_token_id if eos_token_id is not None else getattr(model.config, "eos_token_id", None)
@@ -111,6 +130,7 @@ def generate(
 
     # KV-memory bookkeeping: split layers by kind and size one key/value entry.
     series_full, series_slid, series_tot = [], [], []
+    series_quant, series_bf16 = [], []
     if record_kv:
         lt = getattr(model.config, "layer_types", None) or ["full_attention"] * len(cache.layers)
         full_idx = [i for i, t in enumerate(lt) if t == "full_attention"]
@@ -140,6 +160,19 @@ def generate(
         peak_kv = max(peak_kv, cur_len)
         if record_kv:
             _record()                                   # post-append high-water for this step
+        if quant_cache:
+            # Decode: push the 1 new token from each layer into qcache.
+            for li in range(len(cache.layers)):
+                k = cache.layers[li].keys[0]    # [n_kv, total, d]
+                v = cache.layers[li].values[0]
+                step_start = min(quant_prev_len, k.shape[-2])
+                new_k = k[:, step_start:].unsqueeze(0)   # [1, n_kv, new, d]
+                new_v = v[:, step_start:].unsqueeze(0)
+                if new_k.shape[-2] > 0:
+                    qcache.update(li, new_k, new_v)
+            quant_prev_len = max(cache.layers[li].keys.shape[-2] for li in range(len(cache.layers)))
+            series_quant.append(qcache.mem_bytes())
+            series_bf16.append(qcache.bf16_bytes())
         if next_tok.item() in eos_set:
             break
 
@@ -164,4 +197,6 @@ def generate(
         kv_bytes_full=series_full,
         kv_bytes_sliding=series_slid,
         kv_bytes_total=series_tot,
+        kv_quant_bytes=series_quant,
+        kv_bf16_bytes=series_bf16,
     )
