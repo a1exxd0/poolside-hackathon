@@ -759,8 +759,10 @@ class HierarchyPipeline:
         split_threshold: int = 20,
         n_topics: int = 5,
         topic_rebuild_every: int = 5,
+        sbert_instance=None,
     ) -> None:
-        self._sbert = SentenceTransformer(sbert_model)
+        # Accept a pre-loaded SentenceTransformer to avoid reloading across calls
+        self._sbert = sbert_instance if sbert_instance is not None else SentenceTransformer(sbert_model)
         self._graph = SemanticGraph(dim=EMBED_DIM, k_neighbors=k_neighbors)
         self._chunker = StreamingChunker(
             sbert=self._sbert,

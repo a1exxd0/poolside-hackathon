@@ -8,3 +8,6 @@ sentence-transformers>=3.0.0
 python-louvain>=0.16
 scikit-learn>=1.4.0
 networkx>=3.0
+datasets>=2.0.0
+editdistance>=0.6.0
+tqdm

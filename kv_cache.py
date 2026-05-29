@@ -22,7 +22,17 @@ import torch
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
-from hierarchy import HierarchyPipeline, HierarchyTree
+from sentence_transformers import SentenceTransformer
+from hierarchy import HierarchyPipeline, HierarchyTree, SBERT_MODEL
+
+# Loaded once per process; shared across all generate_with_hierarchy calls.
+_sbert: Optional[SentenceTransformer] = None
+
+def _get_sbert() -> SentenceTransformer:
+    global _sbert
+    if _sbert is None:
+        _sbert = SentenceTransformer(SBERT_MODEL)
+    return _sbert
 
 
 # ─── Inode data structures ────────────────────────────────────────────────────
@@ -289,7 +299,7 @@ def generate_with_hierarchy(
 
     # ── Build semantic hierarchy from prompt text ──────────────────────────
     prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-    pipeline    = HierarchyPipeline()
+    pipeline    = HierarchyPipeline(sbert_instance=_get_sbert())
     for word in prompt_text.split():
         pipeline.process_word(word)
     pipeline.flush()
