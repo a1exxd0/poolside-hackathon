@@ -3,6 +3,7 @@
 .envrc
 __pycache__/
 *.pyc
+*.egg-info/
 .pytest_cache/
 # calibration artifacts
 *.pt

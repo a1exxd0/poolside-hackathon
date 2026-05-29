@@ -1630,7 +1630,7 @@ wheels = [
 ]
 
 [[package]]
-name = "triattention"
+name = "kv-quant"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

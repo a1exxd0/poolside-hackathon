@@ -1,59 +1,36 @@
-# TriAttention
+# 4-bit KV Cache Quantization (Laguna-XS.2)
 
-Implementation of **arXiv:2604.04921v1** — *"TriAttention: Efficient Long Reasoning with
-Trigonometric KV Compression"* — for optimizing inference of the LagunaXS.2 model.
+A study of low-bit KV-cache quantization for vLLM. Full writeup, findings, and
+implementation notes are in **[PROBLEM.md](PROBLEM.md)**.
 
-TriAttention is a **KV-cache eviction** method. Queries/keys concentrate around stable complex
-centres in *pre-RoPE* space, so each cached key's future importance can be predicted from a
-trigonometric series plus a norm term, and the cache pruned to a fixed budget during decoding.
+## Finding
 
-## Method (per layer, per kv-head)
-
-Every `β` generated tokens, prune the KV cache to budget `B`, keeping the top-`B` keys by score
-plus `sink` leading tokens:
-
-```
-S_trig(k) = mean_{δ∈D} Σ_f |E[q_f]|·|k_f|·cos(ω_f·(p_q+δ) + arg E[q_f] − arg k_postRoPE_f)
-S_norm(k) = Σ_f (1 − R_f)·E[|q_f|]·|k_f|         R_f = |E[q_f]| / E[|q_f|]
-score(k)  = S_trig(k) + S_norm(k)               D = {2^0, …, 2^16}
-```
-GQA: z-score each query head's scores, then take the max across the group. `E[q_f]`, `E[|q_f|]`,
-`R_f` and the dominant bands (top-K by `C_f = E[|q_f|]·E[|k_f|]`) are estimated offline.
-
-**Key trick:** RoPE preserves band magnitude and folds the key position into its angle, so scoring
-reads `|k_f|` and `arg k_f` straight off the cached post-RoPE keys — no key-position tracking.
+The lever for 4-bit KV is the block **layout**, not the number format or the
+calibration. Uniform **INT4 with per-channel-K (KIVI) blocking** — a 16-token
+block per channel for K, per-token for V — beats vLLM's shipped
+NVFP4 / head_dim / absmax baseline by ~25% on K reconstruction error at identical
+memory (3.56× vs BF16), and the advantage **grows with context** (neutral below
+~512 tokens, ~20–25% KL reduction beyond 1k). 4-bit is the quality floor; INT3
+costs ~2–3× the distortion. The catch: per-channel blocking can't ride NVFP4's
+hardware microscale, so capturing it needs a software INT4 KV path.
 
 ## Layout
 
-```
-triattention/
-  rope.py          complex-band primitives (rotate_half convention)
-  calibration.py   offline pre-RoPE Q/K stats via q_proj/k_proj forward hooks
-  scoring.py       per_head_scores / score_keys (S_trig + S_norm, GQA aggregation)
-  generate.py      _compress_layer eviction + compression-aware greedy decode loop
-tests/             RoPE invariants, logit decomposition, scoring, eviction (pytest)
-scripts/
-  _common.py       model loader + calibration corpus
-  validate_local.py  calibrate → baseline vs compressed generation comparison
-```
+- `kv_quant.py` — quantization primitives: formats (INT4 / INT3 / NVFP4-e2m1),
+  block layouts (per-head-dim, per-channel), absmax / MSE-optimal calibration,
+  the `{format} × {layout} × {calib}` sweep, and `roundtrip`.
+- `scripts/quant_sweep.py` — reconstruction-RMSE grid over real KV activations.
+- `scripts/quant_ab.py` — frozen-page teacher-forced KL A/B vs BF16 (incl. INT3).
+- `scripts/quant_longctx.py` — long-context KL-by-position via an SDPA patch.
+- `PROBLEM.md` — full analysis, vLLM kernel notes, cost/benefit.
 
-## Setup & run
+## Run
 
 ```bash
-uv sync                       # Python 3.12 venv; on a CUDA node uv installs the CUDA torch wheel
-uv run pytest -q              # 9 unit tests (no model download)
-uv run python -m scripts.validate_local --budget 256 --beta 64 --max-new 400
+uv sync
+.venv/bin/python scripts/quant_sweep.py     # RMSE grid
+.venv/bin/python scripts/quant_ab.py        # downstream KL A/B
+.venv/bin/python scripts/quant_longctx.py   # long-context trend
 ```
 
-`validate_local.py` defaults to `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` (Qwen2, GQA 12q/2kv) —
-a small reasoning model for sanity-checking. Pass `--model` to point at LagunaXS.2 once available.
-
-## Status
-
-- ✅ Algorithm, calibration, scoring, eviction, decode loop, unit tests.
-- ⏳ End-to-end `validate_local.py` run (do this first on the GPU node).
-- ⛔ Real run: needs the LagunaXS.2 HF repo ID + A100 80GB. Then AIME25 / MATH500 benchmarks.
-
-Assumes a Llama/Qwen2-style decoder (`model.model.layers[i].self_attn.{q_proj,k_proj}`,
-rotate_half RoPE, full attention). Verify LagunaXS.2 matches or adapt the capture hooks.
-Greedy decoding, batch size 1.
+Scripts target `poolside/Laguna-XS.2` and run on the Blackwell node.
