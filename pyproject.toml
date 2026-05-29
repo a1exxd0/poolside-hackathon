@@ -1,7 +1,7 @@
 [project]
-name = "triattention"
+name = "kv-quant"
 version = "0.1.0"
-description = "Add your description here"
+description = "Page-aligned 4-bit KV cache with MSE-optimal blockwise scaling"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.13.0",
@@ -11,7 +11,5 @@ dependencies = [
     "transformers>=5.9.0",
 ]
 
-[dependency-groups]
-dev = [
-    "pytest>=9.0.3",
-]
+[tool.setuptools]
+py-modules = ["kv_quant"]
