@@ -375,7 +375,20 @@ def generate_with_hierarchy(
     def reconstruct(l: int, query: torch.Tensor,
                     gen_k: torch.Tensor, gen_v: torch.Tensor):
         budget_l     = layer_budgets[l]
-        n_recent_gen = min(recent, gen_k.size(1))
+        n_gen        = gen_k.size(1)
+        n_recent_gen = min(recent, n_gen)
+
+        # Fast path: everything fits — return full prefill + all gen, no eviction.
+        if prefill_len + n_gen <= budget_l:
+            pk = prefill_keys[l]
+            pv = prefill_values[l]
+            if n_gen > 0:
+                pk = torch.cat([pk, gen_k], dim=1)
+                pv = torch.cat([pv, gen_v], dim=1)
+            if verbose:
+                print(f"  [layer {l}] no eviction needed "
+                      f"({prefill_len} prefill + {n_gen} gen = {prefill_len + n_gen} ≤ {budget_l})")
+            return pk.unsqueeze(0), pv.unsqueeze(0)
 
         # Always keep: first `sink` tokens (attention sinks) and last `sink`
         # prefill tokens (chat-template boundary / </think> / start-of-answer
