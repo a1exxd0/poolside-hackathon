@@ -1,3 +1,9 @@
 **/venv/
 .env
 .envrc
+__pycache__/
+*.pyc
+.pytest_cache/
+# calibration artifacts
+*.pt
+*.calib
