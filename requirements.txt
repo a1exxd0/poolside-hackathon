@@ -1,4 +1,5 @@
+accelerate
 openai
 python-dotenv
-transformers
 torch
+transformers
