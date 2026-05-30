@@ -235,7 +235,8 @@ def run_benchmark(
     methods: list,
     n: int,
     max_new_tokens: int,
-    output_path: Path | None,
+    out_dir: Path,
+    run_ts: str,
 ):
     cfg = BENCHMARK_CONFIGS[name]
     reported_score = LAGUNA_SCORES.get(name)
@@ -258,83 +259,132 @@ def run_benchmark(
         print(f"[SKIP] Could not load {cfg['hf_path']}: {e}")
         return []
 
+    # One output file per method, named so the harness can consume them directly.
+    # Format per line: {instance_id, model_patch, model_name_or_path, ...metrics}
+    # Extra fields are ignored by the harness but preserved for our analysis.
+    def pred_path(method_name: str) -> Path:
+        return out_dir / f"{name}_{method_name}_{run_ts}.jsonl"
+
+    # Open all output files upfront so we can flush per-sample
+    out_files = {"baseline": open(pred_path("baseline"), "w", encoding="utf-8")}
+    for m in methods:
+        out_files[m] = open(pred_path(m), "w", encoding="utf-8")
+
     samples = list(ds.select(range(min(n, len(ds)))))
     cache = EmbeddingCache()
     results = []
     skipped = 0
 
-    for i, row in enumerate(samples):
-        instance_id = row.get(cfg["id_field"], f"sample_{i}")
+    try:
+        for i, row in enumerate(samples):
+            instance_id = row.get(cfg["id_field"], f"sample_{i}")
 
-        print(f"\n[{i+1}/{len(samples)}] {instance_id}")
+            print(f"\n[{i+1}/{len(samples)}] {instance_id}")
 
-        try:
-            user_prompt = build_prompt(row)
-            if not user_prompt.strip():
-                print("  [SKIP] empty prompt — unexpected row schema")
+            try:
+                user_prompt = build_prompt(row)
+                if not user_prompt.strip():
+                    print("  [SKIP] empty prompt — unexpected row schema")
+                    skipped += 1
+                    continue
+
+                input_ids = encode_prompt(system, user_prompt, tokenizer, model)
+                orig_len = input_ids.shape[0]
+                print(f"  Prompt tokens : {orig_len}")
+
+                baseline_resp, baseline_time, baseline_gen_tokens = baseline_generate(
+                    input_ids, model, tokenizer, max_new_tokens
+                )
+                baseline_tps = baseline_gen_tokens / baseline_time if baseline_time > 0 else 0
+                print(f"  [baseline]  {baseline_time:.1f}s  "
+                      f"{baseline_gen_tokens} gen_tok  {baseline_tps:.1f} tok/s")
+
+                # Write baseline prediction in harness format
+                out_files["baseline"].write(json.dumps({
+                    "instance_id": instance_id,
+                    "model_patch": baseline_resp,
+                    "model_name_or_path": f"laguna-xs2-baseline",
+                    "original_tokens": orig_len,
+                    "time_s": round(baseline_time, 3),
+                    "gen_tokens": baseline_gen_tokens,
+                    "tok_per_s": round(baseline_tps, 2),
+                }) + "\n")
+                out_files["baseline"].flush()
+
+                record = {
+                    "instance_id": instance_id,
+                    "original_tokens": orig_len,
+                    "baseline_time_s": round(baseline_time, 3),
+                    "baseline_gen_tokens": baseline_gen_tokens,
+                    "methods": {},
+                }
+
+                for method in methods:
+                    try:
+                        dyn_resp, merged_len, dyn_time, dyn_gen_tokens = dynamic_generate(
+                            input_ids, model, tokenizer, method, cache, max_new_tokens
+                        )
+                        sf = shortening_factor(orig_len, merged_len)
+                        dyn_tps = dyn_gen_tokens / dyn_time if dyn_time > 0 else 0
+                        tps_ratio = dyn_tps / baseline_tps if baseline_tps > 0 else float("inf")
+                        print(f"  [{method}]  {merged_len}/{orig_len} tok  SF {sf:.2f}x  "
+                              f"{dyn_time:.1f}s  {dyn_gen_tokens} gen_tok  "
+                              f"{dyn_tps:.1f} tok/s  ({tps_ratio:.2f}x baseline)")
+
+                        # Write dynamic prediction in harness format
+                        out_files[method].write(json.dumps({
+                            "instance_id": instance_id,
+                            "model_patch": dyn_resp,
+                            "model_name_or_path": f"laguna-xs2-{method}",
+                            "original_tokens": orig_len,
+                            "merged_tokens": merged_len,
+                            "shortening_factor": round(sf, 4),
+                            "time_s": round(dyn_time, 3),
+                            "gen_tokens": dyn_gen_tokens,
+                            "tok_per_s": round(dyn_tps, 2),
+                            "tps_ratio": round(tps_ratio, 4),
+                        }) + "\n")
+                        out_files[method].flush()
+
+                        record["methods"][method] = {
+                            "merged_tokens": merged_len,
+                            "shortening_factor": round(sf, 4),
+                            "time_s": round(dyn_time, 3),
+                            "gen_tokens": dyn_gen_tokens,
+                            "tok_per_s": round(dyn_tps, 2),
+                            "tps_ratio": round(tps_ratio, 4),
+                        }
+                    except Exception as e:
+                        print(f"  [{method}]  ERROR: {e}")
+                        record["methods"][method] = {"error": str(e)}
+
+                results.append(record)
+
+            except Exception as e:
+                print(f"  [SKIP] sample failed: {e}")
                 skipped += 1
                 continue
 
-            input_ids = encode_prompt(system, user_prompt, tokenizer, model)
-            orig_len = input_ids.shape[0]
-            print(f"  Prompt tokens : {orig_len}")
-
-            baseline_resp, baseline_time, baseline_gen_tokens = baseline_generate(
-                input_ids, model, tokenizer, max_new_tokens
-            )
-            baseline_tps = baseline_gen_tokens / baseline_time if baseline_time > 0 else 0
-            print(f"  [baseline]  {baseline_time:.1f}s  "
-                  f"{baseline_gen_tokens} gen_tok  {baseline_tps:.1f} tok/s")
-
-            record = {
-                "benchmark": name,
-                "instance_id": instance_id,
-                "original_tokens": orig_len,
-                "max_new_tokens": max_new_tokens,
-                "baseline_time_s": round(baseline_time, 3),
-                "baseline_gen_tokens": baseline_gen_tokens,
-                "baseline_tok_per_s": round(baseline_tps, 2),
-                "baseline_response": baseline_resp,
-                "methods": {},
-            }
-
-            for method in methods:
-                try:
-                    dyn_resp, merged_len, dyn_time, dyn_gen_tokens = dynamic_generate(
-                        input_ids, model, tokenizer, method, cache, max_new_tokens
-                    )
-                    sf = shortening_factor(orig_len, merged_len)
-                    dyn_tps = dyn_gen_tokens / dyn_time if dyn_time > 0 else 0
-                    tps_ratio = dyn_tps / baseline_tps if baseline_tps > 0 else float("inf")
-                    print(f"  [{method}]  {merged_len}/{orig_len} tok  SF {sf:.2f}x  "
-                          f"{dyn_time:.1f}s  {dyn_gen_tokens} gen_tok  "
-                          f"{dyn_tps:.1f} tok/s  ({tps_ratio:.2f}x baseline)")
-                    record["methods"][method] = {
-                        "merged_tokens": merged_len,
-                        "shortening_factor": round(sf, 4),
-                        "time_s": round(dyn_time, 3),
-                        "gen_tokens": dyn_gen_tokens,
-                        "tok_per_s": round(dyn_tps, 2),
-                        "tps_ratio": round(tps_ratio, 4),
-                        "response": dyn_resp,
-                    }
-                except Exception as e:
-                    print(f"  [{method}]  ERROR: {e}")
-                    record["methods"][method] = {"error": str(e)}
-
-            results.append(record)
-
-            if output_path:
-                with open(output_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(record) + "\n")
-
-        except Exception as e:
-            print(f"  [SKIP] sample failed: {e}")
-            skipped += 1
-            continue
+    finally:
+        for f in out_files.values():
+            f.close()
 
     if skipped:
         print(f"\n  {skipped}/{len(samples)} samples skipped due to errors.")
+
+    print(f"\n  Predictions written (harness-ready):")
+    for method_name, f in out_files.items():
+        p = pred_path(method_name)
+        print(f"    {p}")
+    print(f"\n  To score with the official harness:")
+    hf_path = cfg["hf_path"]
+    for method_name in list(out_files):
+        p = pred_path(method_name)
+        print(f"    python -m swebench.harness.run_evaluation "
+              f"--dataset_name {hf_path} "
+              f"--predictions_path {p} "
+              f"--run_id laguna-xs2-{method_name} "
+              f"--max_workers 4")
 
     return results
 
@@ -415,10 +465,10 @@ def main():
         help="Max tokens to generate per sample",
     )
     parser.add_argument(
-        "--output",
+        "--output_dir",
         type=str,
-        default=None,
-        help="JSONL file to write results to (default: auto-named per benchmark)",
+        default="predictions",
+        help="Directory to write per-method prediction JSONL files (default: ./predictions)",
     )
     args = parser.parse_args()
 
@@ -427,14 +477,11 @@ def main():
     benchmarks = list(BENCHMARK_CONFIGS) if args.benchmark == "all" else [args.benchmark]
 
     run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     all_results = []
-
     for bench in benchmarks:
-        if args.output:
-            out_path = Path(args.output)
-        else:
-            out_path = Path(f"benchmark_{bench}_{run_ts}.jsonl")
-
         results = run_benchmark(
             name=bench,
             model=model,
@@ -442,10 +489,10 @@ def main():
             methods=methods,
             n=args.n,
             max_new_tokens=args.max_new_tokens,
-            output_path=out_path,
+            out_dir=out_dir,
+            run_ts=run_ts,
         )
         all_results.extend(results)
-        print(f"\nResults saved to {out_path}")
 
     print_summary(all_results, methods)
 
