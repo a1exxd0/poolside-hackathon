@@ -78,6 +78,15 @@ else:
     print(f"[serve] config already at max_position_embeddings={max_len}, full_attention.factor={factor}")
 PY
 
+# --- Tool calling (poolside_v1) --------------------------------------------
+# Laguna ships a tool-aware chat template as a SEPARATE chat_template.jinja
+# (the one embedded in tokenizer_config.json has no tool support). Pass it
+# explicitly so /v1/chat/completions with `tools` renders the <available_tools>
+# / <tool_call> protocol that PoolsideV1ToolParser expects. The matching
+# poolside_v1 reasoning parser strips the <think>...</think> the template emits.
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-$MODEL/chat_template.jinja}"
+[ -f "$CHAT_TEMPLATE" ] || { echo "ERROR: chat template not found at $CHAT_TEMPLATE" >&2; exit 1; }
+
 # --- vLLM ------------------------------------------------------------------
 VLOG="$TOOLS/vllm_serve.log"; : > "$VLOG"
 # Run from a non-vllm/ cwd or `import vllm` resolves to the submodule dir.
@@ -90,13 +99,17 @@ VLOG="$TOOLS/vllm_serve.log"; : > "$VLOG"
     --kv-cache-dtype int4_kivi \
     --gpu-memory-utilization "$GPU_UTIL" \
     --max-model-len "$MAX_LEN" \
+    --chat-template "$CHAT_TEMPLATE" \
+    --enable-auto-tool-choice \
+    --tool-call-parser poolside_v1 \
+    --reasoning-parser poolside_v1 \
     --host 127.0.0.1 --port "$PORT" \
     --enforce-eager \
     --api-key "$KEY" >> "$VLOG" 2>&1 & echo $! > "$TOOLS/vllm.pid" )
 echo "vLLM pid $(cat "$TOOLS/vllm.pid") -- waiting for startup (model load)..."
 for _ in $(seq 1 80); do
   grep -qiE "Application startup complete" "$VLOG" && break
-  if grep -qiE "OutOfMemory|EngineCore failed|Engine core init" "$VLOG"; then
+  if grep -qiE "OutOfMemory|EngineCore failed|Engine core initialization failed|Engine core proc.* died" "$VLOG"; then
     echo "vLLM failed to start -- see $VLOG (likely GPU OOM: check nvidia-smi)"; exit 1
   fi
   sleep 3
