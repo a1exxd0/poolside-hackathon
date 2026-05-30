@@ -1,0 +1,106 @@
+name: Build & deploy INT4-KIVI vLLM endpoint
+
+# Deploy ONLY on push to the kv-quant branch.
+on:
+  push:
+    branches: [kv-quant]
+
+concurrency:
+  group: deploy-kv-quant
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/laguna-int4-kivi
+  # --- HF Inference Endpoint target (set these to your real values) ---------
+  HF_ENDPOINT_NAME: laguna-int4-kivi
+  HF_ENDPOINT_NAMESPACE: a1exxd0   # personal HF account that hosts/pays
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write                       # push to GHCR
+    steps:
+      - name: Checkout (with submodule = custom vLLM fork)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # Guard: the custom int4_kivi backend must actually be present in the
+      # vllm submodule tree, or we'd ship a stock vLLM. Fail loud if missing.
+      - name: Verify custom backend is in the build context
+        run: |
+          test -f vllm/vllm/v1/attention/backends/int4_kivi_attn.py \
+            || { echo "::error::int4_kivi backend missing from ./vllm submodule \
+                 -- see the submodule blocker note. Aborting."; exit 1; }
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update HF Inference Endpoint to new image
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}          # write-scoped HF token
+        run: |
+          pip install --quiet "huggingface_hub>=0.27"
+          python - <<'PY'
+          import os
+          from huggingface_hub import get_inference_endpoint, create_inference_endpoint
+          from huggingface_hub.utils import HfHubHTTPError
+
+          name      = os.environ["HF_ENDPOINT_NAME"]
+          namespace = os.environ["HF_ENDPOINT_NAMESPACE"]
+          image     = f'{os.environ["IMAGE"]}:{os.environ["GITHUB_SHA"]}'
+          repo      = "poolside/Laguna-XS.2"
+
+          custom_image = {
+              "url": image,
+              "port": 8000,
+              "health_route": "/health",
+              # HF_TOKEN secret lets vllm pull the gated model at startup.
+          }
+          try:
+              ep = get_inference_endpoint(name, namespace=namespace)
+              ep.update(custom_image=custom_image)
+              print(f"Updated endpoint {namespace}/{name} -> {image}")
+          except HfHubHTTPError:
+              ep = create_inference_endpoint(
+                  name,
+                  namespace=namespace,
+                  repository=repo,
+                  framework="custom",
+                  task="text-generation",
+                  accelerator="gpu",
+                  # A100 x1 = 80GB, AWS us-east-1 $2.5/h. Needs GPU quota granted
+                  # on the namespace or HF rejects creation (A100 grants are
+                  # usually faster than H100). int4-kivi recompiles for sm_80.
+                  vendor="aws",
+                  region="us-east-1",
+                  instance_size="x1",
+                  instance_type="nvidia-a100",   # NOT B300 -- see hw note
+                  custom_image=custom_image,
+                  type="protected",
+              )
+              print(f"Created endpoint {namespace}/{name} -> {image}")
+          ep.wait()
+          print("Endpoint running:", ep.url)
+          PY
