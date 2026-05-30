@@ -9,6 +9,14 @@ __pycache__/
 # calibration artifacts
 *.pt
 *.calib
+# model weights & fine-tuning checkpoints (multi-GB; base weights live in the
+# HF cache, fine-tune outputs go to a worktree -- never commit either)
+*.safetensors
+*.bin
+*.gguf
+*.pth
+checkpoints/
+**/checkpoints/
 # claude code worktrees
 .claude/
 # local serving tools: keep only the scripts, never the key/binary/logs/pids

@@ -9,10 +9,20 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOLS="$ROOT/.tools"
 VENV="$ROOT/.venv-vllm"
 PORT="${PORT:-8000}"
-# Serve the patched NVFP4 snapshot from the HF cache by absolute path so vLLM
-# loads our edited config.json verbatim (no hub re-check / no re-download that
-# could revert the 1M rope patch). Override with MODEL=... if needed.
-MODEL="${MODEL:-/home/alex/.cache/huggingface/hub/models--poolside--Laguna-XS.2-NVFP4/snapshots/d9c13a066a97f81abd091da69f17ec5cb72a93ca}"
+# Model: resolve (and download weights if missing) the NVFP4 repo via
+# `hf download`, which is idempotent and prints the local snapshot dir. The 1M
+# rope patch is (re)applied to that dir below, so a fresh download shipping the
+# native-256k config is fine. Override MODEL=<dir> to serve a local copy (e.g. a
+# fine-tuned checkpoint), or MODEL_REPO=<id> for a different hub model.
+MODEL_REPO="${MODEL_REPO:-poolside/Laguna-XS.2-NVFP4}"
+if [ -z "${MODEL:-}" ]; then
+  echo "Resolving $MODEL_REPO (downloading weights if missing)..."
+  # `hf download` prints the snapshot dir on its last line, prefixed "path="
+  # in current CLI versions -- strip it if present.
+  MODEL="$("$VENV/bin/hf" download "$MODEL_REPO" | tail -1)"
+  MODEL="${MODEL#path=}"
+fi
+[ -d "$MODEL" ] || { echo "ERROR: model dir not resolved (got '$MODEL')" >&2; exit 1; }
 # Honour the full 1M context the patched config advertises (256x YaRN; quality
 # degrades past the model's native 256k -- accepted by design). B300 has 275GB,
 # so raise GPU util to guarantee the KV cache can hold a 1M-token sequence.
