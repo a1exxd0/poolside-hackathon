@@ -36,6 +36,16 @@ jobs:
             || { echo "::error::int4_kivi backend missing from ./vllm submodule \
                  -- see the submodule blocker note. Aborting."; exit 1; }
 
+      # Standard runners have ~14GB free on /; a CUDA-devel base + torch-cu130
+      # + vLLM overruns it (os error 28). Reclaim ~25GB of preinstalled SDKs.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                      /usr/local/lib/android /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune -af || true
+          df -h /
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:

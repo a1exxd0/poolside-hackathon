@@ -17,6 +17,9 @@ FROM nvidia/cuda:12.8.0-devel-ubuntu22.04 AS base
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     CUDA_HOME=/usr/local/cuda-12.8 \
+    # .git is excluded from the build context, so vLLM's setuptools-scm can't
+    # derive a version from git -- pin it explicitly to match the pinned commit.
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.13.0 \
     # A100 = sm_80. (H100=9.0a; B300=10.3a needs a CUDA>=12.9 base.)
     # Mostly moot with VLLM_USE_PRECOMPILED=1 (nothing CUDA-compiles at build),
     # but set to the target arch for any source build path.
