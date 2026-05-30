@@ -10,10 +10,14 @@ KIVI layout). Branch `kv-quant`, worktree `/home/alex/poolside-hackathon-kv-quan
   fallback for partial blocks.
 - ✅ Serves accurately at scale (20-trial / 60-prompt batches to 32k context).
 - ✅ Accurate + benchmarked serving numbers obtained for int4 vs bf16 (below).
-- ✅ **Fused paged decode** (branch `kv-quant-decode-speed`, vllm submodule branch
-  `int4-kivi-decode-speed`): pure-decode batches now run a fused INT4 flash-decode
-  straight off the packed cache — no dense `(B,H,max_seq,D)` materialization, K/V
-  read at 4 bits. Validated == dense path; **decode kernel 2.4–10× faster** (below).
+- ✅ **Fused paged decode — v1 landed, NOT finished** (branch `kv-quant-decode-speed`,
+  vllm submodule branch `int4-kivi-decode-speed`): pure-decode batches now run a fused
+  INT4 flash-decode straight off the packed cache — no dense `(B,H,max_seq,D)`
+  materialization, K/V read at 4 bits. Validated == dense path; **2.4–10× faster than the
+  old dense-dequant fallback**. ⚠️ BUT still **~2.4× slower end-to-end (≈18× at the
+  decode-kernel level) than bf16 FlashAttention** — the dense-materialize penalty is gone,
+  the *quantized-decode-vs-FA* gap is not. **Are we done fusing? No** — see "Fused decode"
+  + the optimization levers at the bottom.
 
 ## Results (vLLM serving path, Laguna-XS.2, B300, enforce_eager)
 **Needle-in-code retrieval** (exact-int recall, `scripts/needle_serving.py`, 20 trials/len):
@@ -40,7 +44,13 @@ needle the int4 cost is *non-monotonic* (worst at 8k, parity at 32k) — that me
 exact-digit recall and is fragile to single-token logit flips, so treat HumanEval
 pass@1 as the more reliable signal.
 
-## Fused decode (decode-speed future-work item — ✅ DONE)
+## Fused decode (decode-speed future-work item — 🟡 v1 LANDED, NOT DONE)
+**Status in one line:** the fusion that *removes the dense bf16 materialization* is
+implemented, correct, and merged-ready; the fused decode is **not yet competitive with
+bf16 FlashAttention** (~2.4× slower e2e @12k, ~18× at the kernel), and the kernel-level
+optimization levers (tensor-core bf16 `tl.dot`, fused combine, CUDA graphs) are **untouched**.
+So: done with *this* fusion step, **not** done making quantized decode fast.
+
 The old decode path (`_dequant_and_attend`) re-dequantized the **whole** context to a
 dense bf16 `(B,H,max_seq,D)` tensor every step — the bulk of decode latency. The new
 fused path (`int4_kivi_paged_decode` → `_paged_decode_kernel` + `_decode_combine_kernel`
@@ -118,9 +128,18 @@ Logs: `/tmp/needle_srv_{bf16,int4_fixed}.log`,
 `/tmp/longctx_code_{bf16,int4}.log`; JSON: `/tmp/{needle_serving,longctx_code_serving}_*.json`.
 
 ## Future work (not blocking)
-- **Decode speed:** ✅ done — fused paged flash-decode (see "Fused decode" above).
-  Next lever if needed: CUDA-graph capture (currently eager-only) and a Triton-autotuned
-  `(SPLIT, BLOCK_N)` per context length; warmup to avoid the in-inference JIT spike.
+- **Decode speed / finish the fusion:** 🟡 v1 done (no dense materialize), but still
+  ~2.4× slower e2e (~18× kernel) than bf16 FlashAttention — the fused decode is *not*
+  finished. Ordered levers to close the gap (biggest first):
+  1. **Tensor cores:** cast dequantized K/V to **bf16** and use `tl.dot` on bf16 (currently
+     fp32 math) — this is the dominant ~18× factor; FA wins because it runs tensor-core bf16.
+  2. **Fuse the combine** into the decode epilogue (drop the second `_decode_combine_kernel`
+     launch) and tune `(SPLIT, BLOCK_N)` per context length (autotune); fewer/larger splits.
+  3. **CUDA-graph capture** (currently eager-only) + warmup to kill per-step launch overhead
+     and the in-inference JIT spike.
+  Reality check: even fully tuned, a software int4-dequant decode may not *beat* FA — the
+  honest target is "close the latency gap so the 3.2× cache-memory win is worth it," not
+  "faster than bf16."
 - **Long-context quality:** the 12k HumanEval gap (80 vs 100) is the lever — try keeping a
   short bf16 recent-token tail (like `int4_kivi/hf_cache.py`) or asymmetric/zero-point K.
 - **Grid y-dim:** `_gather_dequant_kernel` (dense fallback) grid is `(B, max_seq, H)`;
