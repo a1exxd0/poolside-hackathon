@@ -260,6 +260,49 @@ class _QueryCapture:
         self.queries.clear()
 
 
+class _KeyCapture:
+    """
+    Post-hook on k_proj: captures all-token pre-RoPE keys during prefill.
+    Stored as [n_kv, seq_len, head_dim] per layer so build_inodes receives
+    keys in the same space as the q_proj queries used for scoring.
+    Call remove() immediately after prefill — only needed for inode building.
+    """
+
+    def __init__(self):
+        self.prefill_keys: Dict[int, torch.Tensor] = {}  # layer → [n_kv, prefill_len, head_dim]
+        self._handles = []
+
+    def install(self, model):
+        cfg  = model.config
+        n_kv = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+
+        for l in range(cfg.num_hidden_layers):
+            try:
+                k_proj = model.model.layers[l].self_attn.k_proj
+            except AttributeError:
+                continue
+
+            def make_hook(li, nkv):
+                def hook(module, inp, output):
+                    # output: [batch, seq, n_kv * head_dim]
+                    seq = output.size(1)
+                    hd  = output.size(-1) // nkv
+                    # [seq, n_kv, head_dim] → [n_kv, seq, head_dim]
+                    self.prefill_keys[li] = (
+                        output[0].reshape(seq, nkv, hd).permute(1, 0, 2).detach()
+                    )
+                return hook
+
+            self._handles.append(
+                k_proj.register_forward_hook(make_hook(l, n_kv))
+            )
+
+    def remove(self):
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+
+
 # ─── Node → token position mapping ───────────────────────────────────────────
 
 def build_node_token_map(
@@ -325,6 +368,7 @@ def generate_with_hierarchy(
     max_new_tokens: int = 200,
     budget:         int = 512,
     sink:           int = 4,
+    tail_window:    int = 64,
     recent:         int = 64,
     k_topics:       int = 3,
     k_leaves:       int = 4,
@@ -340,9 +384,10 @@ def generate_with_hierarchy(
     to select which clusters to materialise.
 
     Active cache at all times:
-      first `sink` prefill tokens  (always kept — attention sinks)
-    ∪ Quest-selected prefill clusters  (hierarchy-driven)
-    ∪ last `recent` generated tokens   (recency window)
+      first `sink` prefill tokens        (always kept — attention sinks)
+    ∪ last `tail_window` prefill tokens  (always kept — question/instruction anchor)
+    ∪ Quest-selected prefill clusters    (hierarchy-driven)
+    ∪ last `recent` generated tokens     (recency window)
     """
     from transformers import DynamicCache
 
@@ -366,14 +411,19 @@ def generate_with_hierarchy(
     tree           = hier["tree"]
     node_token_map = build_node_token_map(hier["nodes"], tokenizer, prompt_text)
 
-    # ── Install query capture hooks ───────────────────────────────────────
+    # ── Install query + key capture hooks ────────────────────────────────
     qcap = _QueryCapture()
     qcap.install(model)
+    kcap = _KeyCapture()
+    kcap.install(model)
 
     # ── Prefill ───────────────────────────────────────────────────────────
     cache = DynamicCache(config=model.config)
     with torch.no_grad():
         out = model(input_ids, past_key_values=cache, use_cache=True)
+
+    # Pre-RoPE keys are only needed for inode building; remove hook now.
+    kcap.remove()
 
     prefill_len = input_ids.size(1)
     current_pos = prefill_len
@@ -416,10 +466,13 @@ def generate_with_hierarchy(
     head_dim = next(iter(prefill_keys.values())).size(2)
 
     # ── Build inodes for full-attention layers only ───────────────────────
+    # Use pre-RoPE keys from kcap so the scoring space matches the pre-RoPE
+    # queries captured by qcap (both from *_proj outputs, before rotation).
     layer_leaf_inodes:  Dict[int, Dict[int, LeafInode]]  = {}
     layer_topic_inodes: Dict[int, Dict[int, TopicInode]] = {}
     for l in full_attn:
-        li, ti = build_inodes(tree, node_token_map, prefill_keys[l])
+        raw_keys = kcap.prefill_keys.get(l, prefill_keys[l])
+        li, ti = build_inodes(tree, node_token_map, raw_keys)
         layer_leaf_inodes[l]  = li
         layer_topic_inodes[l] = ti
 
@@ -442,10 +495,10 @@ def generate_with_hierarchy(
                       f"({prefill_len} prefill + {n_gen} gen = {prefill_len + n_gen} ≤ {budget_l})")
             return pk.unsqueeze(0), pv.unsqueeze(0)
 
-        # Always keep: first `sink` tokens (attention sinks) and last `sink`
-        # prefill tokens (chat-template boundary / start-of-answer tokens).
+        # Always keep: first `sink` tokens (attention sinks) and last
+        # `tail_window` prefill tokens (covers the user's question/instruction).
         sink_pos   = set(range(min(sink, prefill_len)))
-        tail_pos   = set(range(max(sink, prefill_len - sink), prefill_len))
+        tail_pos   = set(range(max(sink, prefill_len - tail_window), prefill_len))
         always_pos = sink_pos | tail_pos
 
         quest_pos = select_by_hierarchy(
