@@ -14,9 +14,9 @@ Pipeline
 
 Usage
 -----
-  python dynamic_inference.py --model xs2 --method whitespace --prompt "Explain transformers"
-  python dynamic_inference.py --model m1  --method all --prompt "Explain transformers"
-  python dynamic_inference.py --model xs2 --method all   # demo prompts
+  python dynamic_inference.py --method whitespace --prompt "Explain transformers"
+  python dynamic_inference.py --method all --prompt "Explain transformers"
+  python dynamic_inference.py --method all   # demo prompts
 """
 
 import argparse
@@ -37,10 +37,7 @@ from dynamic_tokenizer import (
 
 load_dotenv()
 
-MODEL_CONFIGS = {
-    "xs2": {"model_id": "poolside/Laguna-XS.2", "label": "Laguna XS.2"},
-    "m1":  {"model_id": "poolside/Laguna-M.1",  "label": "Laguna M.1"},
-}
+MODEL_ID = "poolside/Laguna-XS.2"
 
 
 def strip_think_block(text: str) -> str:
@@ -61,15 +58,14 @@ def strip_think_block(text: str) -> str:
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model_and_tokenizer(model_key: str = "xs2"):
-    cfg = MODEL_CONFIGS[model_key]
-    print(f"Loading {cfg['label']} ({cfg['model_id']})...")
+def load_model_and_tokenizer():
+    print(f"Loading {MODEL_ID}...")
     tokenizer = AutoTokenizer.from_pretrained(
-        cfg["model_id"],
+        MODEL_ID,
         token=os.getenv("HF_TOKEN"),
     )
     model = AutoModelForCausalLM.from_pretrained(
-        cfg["model_id"],
+        MODEL_ID,
         dtype=torch.bfloat16,
         device_map="auto",
         token=os.getenv("HF_TOKEN"),
@@ -183,11 +179,11 @@ DEMO_PROMPTS = [
 ]
 
 
-def run_demo(model, tokenizer, model_label: str, method: str, max_new_tokens: int = 64):
+def run_demo(model, tokenizer, method: str, max_new_tokens: int = 64):
     cache = EmbeddingCache()
 
     print(f"\n{'='*70}")
-    print(f"Model: {model_label}  |  Method: {method.upper()}")
+    print(f"Method: {method.upper()}")
     print(f"{'='*70}")
 
     for prompt in DEMO_PROMPTS:
@@ -226,12 +222,6 @@ def main():
         description="Dynamic tokenization inference demo for Laguna"
     )
     parser.add_argument(
-        "--model",
-        choices=["xs2", "m1"],
-        default="xs2",
-        help="Which Laguna model to load",
-    )
-    parser.add_argument(
         "--method",
         choices=["whitespace", "entropy", "unigram", "all"],
         default="whitespace",
@@ -251,8 +241,7 @@ def main():
     )
     args = parser.parse_args()
 
-    model, tokenizer = load_model_and_tokenizer(args.model)
-    model_label = MODEL_CONFIGS[args.model]["label"]
+    model, tokenizer = load_model_and_tokenizer()
     methods = ["whitespace", "entropy", "unigram"] if args.method == "all" else [args.method]
 
     if args.prompt:
@@ -260,8 +249,7 @@ def main():
         input_ids = encode_prompt(args.prompt, tokenizer, model)
         orig_len = input_ids.shape[0]
 
-        print(f"\nModel  : {model_label}")
-        print(f"Prompt : {args.prompt}")
+        print(f"\nPrompt : {args.prompt}")
         print(f"Tokens : {orig_len}  |  max_new_tokens={args.max_new_tokens}")
         print("─" * 70)
 
@@ -282,7 +270,7 @@ def main():
             print(f"[{method}] {dyn_resp}\n")
     else:
         for method in methods:
-            run_demo(model, tokenizer, model_label, method, args.max_new_tokens)
+            run_demo(model, tokenizer, method, args.max_new_tokens)
 
 
 if __name__ == "__main__":
