@@ -103,11 +103,9 @@ def baseline_generate(input_ids: torch.Tensor, model, tokenizer, max_new_tokens:
             do_sample=False,
         )
     elapsed = time.perf_counter() - t0
-    response = tokenizer.decode(
-        output_ids[0][input_ids.shape[0]:], skip_special_tokens=True
-    )
-    response = strip_think_block(response)
-    return response, elapsed
+    generated = output_ids[0][input_ids.shape[0]:]
+    response = strip_think_block(tokenizer.decode(generated, skip_special_tokens=True))
+    return response, elapsed, len(generated)
 
 
 
@@ -163,9 +161,10 @@ def dynamic_generate(
         )
 
     elapsed = time.perf_counter() - t0
-    response = strip_think_block(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+    generated = output_ids[0]
+    response = strip_think_block(tokenizer.decode(generated, skip_special_tokens=True))
 
-    return response, original_len, merged_len, elapsed
+    return response, original_len, merged_len, elapsed, len(generated)
 
 
 # ---------------------------------------------------------------------------
@@ -193,22 +192,23 @@ def run_demo(model, tokenizer, method: str, max_new_tokens: int = 64):
         orig_len = input_ids.shape[0]
 
         # Baseline
-        baseline_resp, baseline_time = baseline_generate(
+        baseline_resp, baseline_time, baseline_gen = baseline_generate(
             input_ids, model, tokenizer, max_new_tokens
         )
 
         # Dynamic tokenization
-        dyn_resp, orig_len, merged_len, dyn_time = dynamic_generate(
+        dyn_resp, orig_len, merged_len, dyn_time, dyn_gen = dynamic_generate(
             input_ids, model, tokenizer, method, cache, max_new_tokens
         )
 
         sf = shortening_factor(orig_len, merged_len)
-        speedup = baseline_time / dyn_time if dyn_time > 0 else float("inf")
+        baseline_tps = baseline_gen / baseline_time if baseline_time > 0 else 0
+        dyn_tps = dyn_gen / dyn_time if dyn_time > 0 else 0
 
-        print(f"  Original tokens : {orig_len}")
-        print(f"  Merged tokens   : {merged_len}  (shortening factor {sf:.2f}x)")
-        print(f"  Baseline time   : {baseline_time:.2f}s")
-        print(f"  Dynamic time    : {dyn_time:.2f}s  (speedup {speedup:.2f}x)")
+        print(f"  Original tokens : {orig_len}  →  {merged_len} merged  (SF {sf:.2f}x)")
+        print(f"  Baseline : {baseline_time:.2f}s  {baseline_gen} gen_tok  {baseline_tps:.1f} tok/s")
+        print(f"  Dynamic  : {dyn_time:.2f}s  {dyn_gen} gen_tok  {dyn_tps:.1f} tok/s"
+              f"  ({dyn_tps/baseline_tps:.2f}x)" if baseline_tps > 0 else "")
         print(f"  Baseline output : {baseline_resp[:120]!r}")
         print(f"  Dynamic output  : {dyn_resp[:120]!r}")
 
@@ -253,20 +253,22 @@ def main():
         print(f"Tokens : {orig_len}  |  max_new_tokens={args.max_new_tokens}")
         print("─" * 70)
 
-        baseline_resp, baseline_time = baseline_generate(
+        baseline_resp, baseline_time, baseline_gen = baseline_generate(
             input_ids, model, tokenizer, args.max_new_tokens
         )
-        print(f"[baseline] {baseline_time:.2f}s")
+        baseline_tps = baseline_gen / baseline_time if baseline_time > 0 else 0
+        print(f"[baseline] {baseline_time:.2f}s  {baseline_gen} gen_tok  {baseline_tps:.1f} tok/s")
         print(f"[baseline] {baseline_resp}\n")
 
         for method in methods:
-            dyn_resp, orig_len, merged_len, dyn_time = dynamic_generate(
+            dyn_resp, orig_len, merged_len, dyn_time, dyn_gen = dynamic_generate(
                 input_ids, model, tokenizer, method, cache, args.max_new_tokens
             )
             sf = shortening_factor(orig_len, merged_len)
-            speedup = baseline_time / dyn_time if dyn_time > 0 else float("inf")
+            dyn_tps = dyn_gen / dyn_time if dyn_time > 0 else 0
+            tps_ratio = dyn_tps / baseline_tps if baseline_tps > 0 else float("inf")
             print(f"[{method}] {merged_len}/{orig_len} tokens  SF {sf:.2f}x  "
-                  f"{dyn_time:.2f}s  speedup {speedup:.2f}x")
+                  f"{dyn_time:.2f}s  {dyn_gen} gen_tok  {dyn_tps:.1f} tok/s  ({tps_ratio:.2f}x)")
             print(f"[{method}] {dyn_resp}\n")
     else:
         for method in methods:

@@ -195,8 +195,9 @@ def baseline_generate(input_ids: torch.Tensor, model, tokenizer, max_new_tokens:
             do_sample=False,
         )
     elapsed = time.perf_counter() - t0
-    text = tokenizer.decode(output_ids[0][input_ids.shape[0]:], skip_special_tokens=True)
-    return strip_think_block(text), elapsed
+    generated = output_ids[0][input_ids.shape[0]:]
+    text = strip_think_block(tokenizer.decode(generated, skip_special_tokens=True))
+    return text, elapsed, len(generated)
 
 
 def dynamic_generate(
@@ -220,7 +221,7 @@ def dynamic_generate(
         )
     elapsed = time.perf_counter() - t0
     text = strip_think_block(tokenizer.decode(output_ids[0], skip_special_tokens=True))
-    return text, merged_len, elapsed
+    return text, merged_len, elapsed, len(output_ids[0])
 
 
 # ---------------------------------------------------------------------------
@@ -278,10 +279,12 @@ def run_benchmark(
             orig_len = input_ids.shape[0]
             print(f"  Prompt tokens : {orig_len}")
 
-            baseline_resp, baseline_time = baseline_generate(
+            baseline_resp, baseline_time, baseline_gen_tokens = baseline_generate(
                 input_ids, model, tokenizer, max_new_tokens
             )
-            print(f"  [baseline]  {baseline_time:.1f}s")
+            baseline_tps = baseline_gen_tokens / baseline_time if baseline_time > 0 else 0
+            print(f"  [baseline]  {baseline_time:.1f}s  "
+                  f"{baseline_gen_tokens} gen_tok  {baseline_tps:.1f} tok/s")
 
             record = {
                 "benchmark": name,
@@ -289,24 +292,30 @@ def run_benchmark(
                 "original_tokens": orig_len,
                 "max_new_tokens": max_new_tokens,
                 "baseline_time_s": round(baseline_time, 3),
+                "baseline_gen_tokens": baseline_gen_tokens,
+                "baseline_tok_per_s": round(baseline_tps, 2),
                 "baseline_response": baseline_resp,
                 "methods": {},
             }
 
             for method in methods:
                 try:
-                    dyn_resp, merged_len, dyn_time = dynamic_generate(
+                    dyn_resp, merged_len, dyn_time, dyn_gen_tokens = dynamic_generate(
                         input_ids, model, tokenizer, method, cache, max_new_tokens
                     )
                     sf = shortening_factor(orig_len, merged_len)
-                    speedup = baseline_time / dyn_time if dyn_time > 0 else float("inf")
+                    dyn_tps = dyn_gen_tokens / dyn_time if dyn_time > 0 else 0
+                    tps_ratio = dyn_tps / baseline_tps if baseline_tps > 0 else float("inf")
                     print(f"  [{method}]  {merged_len}/{orig_len} tok  SF {sf:.2f}x  "
-                          f"{dyn_time:.1f}s  speedup {speedup:.2f}x")
+                          f"{dyn_time:.1f}s  {dyn_gen_tokens} gen_tok  "
+                          f"{dyn_tps:.1f} tok/s  ({tps_ratio:.2f}x baseline)")
                     record["methods"][method] = {
                         "merged_tokens": merged_len,
                         "shortening_factor": round(sf, 4),
                         "time_s": round(dyn_time, 3),
-                        "speedup": round(speedup, 4),
+                        "gen_tokens": dyn_gen_tokens,
+                        "tok_per_s": round(dyn_tps, 2),
+                        "tps_ratio": round(tps_ratio, 4),
                         "response": dyn_resp,
                     }
                 except Exception as e:
@@ -360,16 +369,17 @@ def print_summary(all_results: list, methods: list):
         print(f"  Avg baseline time : {sum(baseline_times)/n:.1f}s  (no modification)")
 
         for method in methods:
-            sfs = [r["methods"][method]["shortening_factor"]
-                   for r in records if method in r.get("methods", {})
-                   and "shortening_factor" in r["methods"][method]]
-            speedups = [r["methods"][method]["speedup"]
-                        for r in records if method in r.get("methods", {})
-                        and "speedup" in r["methods"][method]]
-            if not sfs:
+            valid = [r["methods"][method] for r in records
+                     if method in r.get("methods", {})
+                     and "shortening_factor" in r["methods"][method]]
+            if not valid:
                 continue
-            print(f"  [{method}]  avg SF {sum(sfs)/len(sfs):.2f}x  "
-                  f"avg speedup {sum(speedups)/len(speedups):.2f}x")
+            avg_sf = sum(v["shortening_factor"] for v in valid) / len(valid)
+            avg_tps_ratio = sum(v["tps_ratio"] for v in valid) / len(valid)
+            avg_dyn_tps = sum(v["tok_per_s"] for v in valid) / len(valid)
+            print(f"  [{method}]  avg SF {avg_sf:.2f}x  "
+                  f"avg {avg_dyn_tps:.1f} tok/s  "
+                  f"({avg_tps_ratio:.2f}x baseline tok/s)")
 
 
 # ---------------------------------------------------------------------------

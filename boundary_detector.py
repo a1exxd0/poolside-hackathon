@@ -141,7 +141,8 @@ def unigram_boundaries(
             bos_id=-1,
             eos_id=-1,
             character_coverage=1.0,
-            split_by_whitespace=True,  # never cross word boundaries
+            split_by_whitespace=True,
+            minloglevel=2,  # suppress INFO/WARNING from sentencepiece trainer
         )
 
         sp = spm.SentencePieceProcessor()
