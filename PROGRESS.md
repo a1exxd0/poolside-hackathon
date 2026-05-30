@@ -57,8 +57,13 @@ Logs: `/tmp/needle_srv_{bf16,int4_fixed}.log`,
   decode (dequant-in-kernel, no (B,H,max_seq,D) materialization). Biggest win available.
 - **Long-context quality:** the 12k HumanEval gap (80 vs 100) is the lever — try keeping a
   short bf16 recent-token tail (like `int4_kivi/hf_cache.py`) or asymmetric/zero-point K.
-- **Grid y-dim:** `_gather_dequant_kernel` grid is `(B, max_seq, H)`; max_seq>65535 would
-  exceed the CUDA y-dim limit. Fine for max_model_len≤64k; tile if ever larger.
+- ✅ **Grid y-dim (DONE, branch `kv-quant-grid-y-dim`):** `_gather_dequant_kernel` grid was
+  `(B, max_seq, H)`, putting the position axis on grid.y whose CUDA limit is 65535 — any
+  gather with `max_seq>65535` (max_model_len past 64k) failed to launch with CUDA "invalid
+  argument". Fixed by reordering to `(max_seq, B, H)`: the position axis now rides grid.x
+  (limit ~2**31); B and H stay on y/z where they fit. No tiling needed. Regression test:
+  `vllm/tests/v1/attention/test_int4_kivi_grid.py` (gather at max_seq=70000 launches +
+  round-trips; old grid raised). Verified old code raises, new code passes.
 
 ## DO NOT MODIFY (validated references)
 `int4_kivi/*.py`, `kv_quant.py`, `tests/test_int4_kivi.py`, `/tmp/vllm_needle.py`.
