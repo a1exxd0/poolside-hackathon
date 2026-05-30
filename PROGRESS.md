@@ -64,7 +64,3 @@ Logs: `/tmp/needle_srv_{bf16,int4_fixed}.log`,
   (limit ~2**31); B and H stay on y/z where they fit. No tiling needed. Regression test:
   `vllm/tests/v1/attention/test_int4_kivi_grid.py` (gather at max_seq=70000 launches +
   round-trips; old grid raised). Verified old code raises, new code passes.
-
-## DO NOT MODIFY (validated references)
-`int4_kivi/*.py`, `kv_quant.py`, `tests/test_int4_kivi.py`, `/tmp/vllm_needle.py`.
-Never use system python/pip — only `uv` / `.venv-vllm`.
