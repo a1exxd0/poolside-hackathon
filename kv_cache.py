@@ -18,12 +18,17 @@ Design:
 
 from __future__ import annotations
 
+import bisect
+import re
 import torch
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
 from sentence_transformers import SentenceTransformer
 from hierarchy import HierarchyPipeline, HierarchyTree, SBERT_MODEL
+
+# Minimum per-layer slack above sink+recent in the PyramidKV b_min formula.
+_PYRAMID_SLACK = 16
 
 # Loaded once per process; shared across all generate_with_hierarchy calls.
 _sbert: Optional[SentenceTransformer] = None
@@ -55,21 +60,6 @@ class TopicInode:
     key_max:  torch.Tensor         # [n_kv_heads, head_dim] — max over all children
 
 
-# ─── Quest scoring ────────────────────────────────────────────────────────────
-
-def _quest_score(
-    query:   torch.Tensor,  # [n_kv_heads, head_dim]
-    key_min: torch.Tensor,  # [n_kv_heads, head_dim]
-    key_max: torch.Tensor,  # [n_kv_heads, head_dim]
-) -> torch.Tensor:          # scalar
-    """
-    Quest §3.2 upper bound on q·k for any k in the inode:
-        score = Σ_head Σ_d  q_d * key_max_d   (if q_d > 0)
-                            q_d * key_min_d   (if q_d ≤ 0)
-    """
-    return (query * torch.where(query > 0, key_max, key_min)).sum()
-
-
 # ─── Build inodes from the hierarchy tree ────────────────────────────────────
 
 def build_inodes(
@@ -78,14 +68,25 @@ def build_inodes(
     keys:           torch.Tensor,           # [n_kv_heads, prefill_len, head_dim]
 ) -> tuple[Dict[int, LeafInode], Dict[int, TopicInode]]:
     """
-    Augment every LeafCluster and TopicNode with Quest min/max key metadata
-    derived from the actual transformer keys at those token positions.
+    Augment every LeafCluster and TopicNode with Quest min/max key metadata.
+    Uses scatter_reduce for batched per-cluster min/max; avoids creating one
+    intermediate tensor per cluster.
     """
-    prefill_len = keys.size(1)
+    n_kv, prefill_len, head_dim = keys.shape
 
-    # Leaf inodes: one per LeafCluster
-    leaf_inodes: Dict[int, LeafInode] = {}
+    cluster_ids = list(tree.leaf_clusters.keys())
+    C = len(cluster_ids)
+    if C == 0:
+        return {}, {}
+
+    cid_to_dense = {cid: i for i, cid in enumerate(cluster_ids)}
+
+    # Assign each valid token position to a dense cluster index.
+    pos_to_cluster = torch.full((prefill_len,), -1, dtype=torch.long, device=keys.device)
+    cluster_positions: Dict[int, List[int]] = {}  # dense_idx → sorted token positions
+
     for cid, cluster in tree.leaf_clusters.items():
+        dense_idx = cid_to_dense[cid]
         positions = sorted({
             p
             for nid in cluster.member_node_ids
@@ -94,15 +95,39 @@ def build_inodes(
         })
         if not positions:
             continue
-        k = keys[:, positions, :]               # [n_kv_heads, n_pos, head_dim]
+        cluster_positions[dense_idx] = positions
+        for p in positions:
+            pos_to_cluster[p] = dense_idx
+
+    assigned_pos = (pos_to_cluster >= 0).nonzero(as_tuple=True)[0]
+    if assigned_pos.numel() == 0:
+        return {}, {}
+
+    keys_assigned = keys[:, assigned_pos, :]                                  # [n_kv, n_asgn, head_dim]
+    cluster_idx   = pos_to_cluster[assigned_pos]                              # [n_asgn]
+    idx_expanded  = cluster_idx.view(1, -1, 1).expand(n_kv, -1, head_dim)    # [n_kv, n_asgn, head_dim]
+
+    cluster_mins = torch.full((n_kv, C, head_dim), float("inf"),
+                              device=keys.device, dtype=keys.dtype)
+    cluster_maxs = torch.full((n_kv, C, head_dim), float("-inf"),
+                              device=keys.device, dtype=keys.dtype)
+    cluster_mins.scatter_reduce_(1, idx_expanded, keys_assigned, reduce="amin", include_self=True)
+    cluster_maxs.scatter_reduce_(1, idx_expanded, keys_assigned, reduce="amax", include_self=True)
+
+    # Leaf inodes: one per cluster that has at least one mapped position.
+    leaf_inodes: Dict[int, LeafInode] = {}
+    for cid in cluster_ids:
+        dense_idx = cid_to_dense[cid]
+        if dense_idx not in cluster_positions:
+            continue
         leaf_inodes[cid] = LeafInode(
             cluster_id=cid,
-            token_positions=positions,
-            key_min=k.min(dim=1).values,        # [n_kv_heads, head_dim]
-            key_max=k.max(dim=1).values,
+            token_positions=cluster_positions[dense_idx],
+            key_min=cluster_mins[:, dense_idx, :],
+            key_max=cluster_maxs[:, dense_idx, :],
         )
 
-    # Topic inodes: aggregate min/max over all child leaves
+    # Topic inodes: aggregate min/max over child leaves.
     topic_inodes: Dict[int, TopicInode] = {}
     for tid, topic in tree.topic_nodes.items():
         child_ids = [cid for cid in topic.leaf_cluster_ids if cid in leaf_inodes]
@@ -134,45 +159,41 @@ def select_by_hierarchy(
     Level 2: Quest-score their child LeafInodes → top k_leaves per topic.
     Returns set of token positions to load into the active cache.
 
-    Falls back to direct leaf scoring if topics haven't been built yet
-    (short prompt where topic_rebuild_every hasn't triggered).
+    Scoring is fully vectorized per level: all topics (or leaves within a
+    topic) are scored in a single tensor op rather than one call per inode.
+    Falls back to direct leaf scoring for leaves not yet assigned to a topic.
     """
-    # Leaves not covered by any topic (topic rebuild may not have run yet)
-    covered = {cid for t in topic_inodes.values() for cid in t.leaf_ids}
+    covered       = {cid for t in topic_inodes.values() for cid in t.leaf_ids}
     orphan_leaves = {cid: lf for cid, lf in leaf_inodes.items() if cid not in covered}
 
     positions: Set[int] = set()
+    # Unsqueeze once; broadcast over stacked topic/leaf tensors.
+    q = query.unsqueeze(0)  # [1, n_kv, head_dim]
 
     if topic_inodes:
-        # Level 1: score topics
         t_ids    = list(topic_inodes.keys())
-        t_scores = torch.stack([
-            _quest_score(query, topic_inodes[tid].key_min, topic_inodes[tid].key_max)
-            for tid in t_ids
-        ])
+        t_mins   = torch.stack([topic_inodes[tid].key_min for tid in t_ids])  # [T, n_kv, head_dim]
+        t_maxs   = torch.stack([topic_inodes[tid].key_max for tid in t_ids])
+        t_scores = (q * torch.where(q > 0, t_maxs, t_mins)).sum(dim=(-2, -1))  # [T]
         _, top_t = t_scores.topk(min(k_topics, len(t_ids)))
 
-        # Level 2: score leaves within each selected topic
         for i in top_t.tolist():
             topic = topic_inodes[t_ids[i]]
             avail = [cid for cid in topic.leaf_ids if cid in leaf_inodes]
             if not avail:
                 continue
-            l_scores = torch.stack([
-                _quest_score(query, leaf_inodes[cid].key_min, leaf_inodes[cid].key_max)
-                for cid in avail
-            ])
+            l_mins   = torch.stack([leaf_inodes[cid].key_min for cid in avail])  # [L, n_kv, head_dim]
+            l_maxs   = torch.stack([leaf_inodes[cid].key_max for cid in avail])
+            l_scores = (q * torch.where(q > 0, l_maxs, l_mins)).sum(dim=(-2, -1))  # [L]
             _, top_l = l_scores.topk(min(k_leaves, len(avail)))
             for li in top_l.tolist():
                 positions.update(leaf_inodes[avail[li]].token_positions)
 
-    # Score any orphan leaves directly (not yet assigned to a topic)
     if orphan_leaves:
         o_cids   = list(orphan_leaves.keys())
-        o_scores = torch.stack([
-            _quest_score(query, orphan_leaves[cid].key_min, orphan_leaves[cid].key_max)
-            for cid in o_cids
-        ])
+        o_mins   = torch.stack([orphan_leaves[cid].key_min for cid in o_cids])
+        o_maxs   = torch.stack([orphan_leaves[cid].key_max for cid in o_cids])
+        o_scores = (q * torch.where(q > 0, o_maxs, o_mins)).sum(dim=(-2, -1))
         _, top_o = o_scores.topk(min(k_leaves, len(o_cids)))
         for i in top_o.tolist():
             positions.update(orphan_leaves[o_cids[i]].token_positions)
@@ -220,7 +241,7 @@ class _QueryCapture:
                 def hook(module, inp, output):
                     last = output[0, -1]          # [n_q * head_dim]
                     if last.numel() % nq != 0:
-                        return                     # layer has different head count; use fallback
+                        return
                     hd = last.numel() // nq
                     q  = last.reshape(nq, hd)
                     if nq != nkv:
@@ -242,20 +263,56 @@ class _QueryCapture:
 # ─── Node → token position mapping ───────────────────────────────────────────
 
 def build_node_token_map(
-    nodes_info: Dict[int, dict],  # pipeline.get_hierarchy()["nodes"]
+    nodes_info:  Dict[int, dict],  # pipeline.get_hierarchy()["nodes"]
     tokenizer,
+    prompt_text: str,
 ) -> Dict[int, List[int]]:
     """
     Map each GraphNode to its token positions in the tokenized prompt.
-    GraphNodes are created in ascending ID order (the chunker assigns IDs
-    incrementally), so cumulative tokenization gives each chunk its span.
+
+    For fast tokenizers: uses character-level offset mapping for exact BPE
+    alignment. Each chunk is located by its word-index span (chunks are built
+    from consecutive words of prompt_text.split()), then token indices whose
+    character midpoint falls within that span are collected.
+
+    For slow tokenizers: falls back to cumulative re-tokenization (approximate).
     """
-    node_token_map: Dict[int, List[int]] = {}
-    cumulative = 0
+    if not getattr(tokenizer, "is_fast", False):
+        node_token_map: Dict[int, List[int]] = {}
+        cumulative = 0
+        for nid in sorted(nodes_info.keys()):
+            tokens = tokenizer.encode(nodes_info[nid]["text"], add_special_tokens=False)
+            node_token_map[nid] = list(range(cumulative, cumulative + len(tokens)))
+            cumulative += len(tokens)
+        return node_token_map
+
+    encoding = tokenizer(prompt_text, return_offsets_mapping=True, add_special_tokens=False)
+    offsets  = encoding["offset_mapping"]  # [(char_start, char_end), ...]
+
+    # Character spans of each whitespace-delimited word (matches str.split()).
+    word_spans  = [(m.start(), m.end()) for m in re.finditer(r"\S+", prompt_text)]
+    word_starts = [ws for ws, _ in word_spans]
+
+    # Map each token to the word containing its character midpoint.
+    token_to_word: Dict[int, int] = {}
+    for tok_idx, (ts, te) in enumerate(offsets):
+        if ts == te:
+            continue  # zero-length token (special token sentinel)
+        mid = (ts + te) // 2
+        wi  = bisect.bisect_right(word_starts, mid) - 1
+        if 0 <= wi < len(word_spans) and mid < word_spans[wi][1]:
+            token_to_word[tok_idx] = wi
+
+    word_cursor = 0
+    node_token_map = {}
     for nid in sorted(nodes_info.keys()):
-        tokens = tokenizer.encode(nodes_info[nid]["text"], add_special_tokens=False)
-        node_token_map[nid] = list(range(cumulative, cumulative + len(tokens)))
-        cumulative += len(tokens)
+        n_words        = len(nodes_info[nid]["text"].split())
+        chunk_word_set = set(range(word_cursor, word_cursor + n_words))
+        node_token_map[nid] = sorted(
+            tok_idx for tok_idx, wi in token_to_word.items()
+            if wi in chunk_word_set
+        )
+        word_cursor += n_words
     return node_token_map
 
 
@@ -294,7 +351,7 @@ def generate_with_hierarchy(
     n_layers = model.config.num_hidden_layers
 
     # PyramidKV: bottom layer gets 2×budget, top layer gets budget÷2
-    b_min = max(sink + recent + 16, budget // 2)
+    b_min = max(sink + recent + _PYRAMID_SLACK, budget // 2)
     b_max = budget * 2
     layer_budgets = pyramid_budgets(n_layers, b_min, b_max)
 
@@ -305,17 +362,15 @@ def generate_with_hierarchy(
         pipeline.process_word(word)
     pipeline.flush()
 
-    hier        = pipeline.get_hierarchy()
-    tree        = hier["tree"]
-    node_token_map = build_node_token_map(hier["nodes"], tokenizer)
+    hier           = pipeline.get_hierarchy()
+    tree           = hier["tree"]
+    node_token_map = build_node_token_map(hier["nodes"], tokenizer, prompt_text)
 
     # ── Install query capture hooks ───────────────────────────────────────
     qcap = _QueryCapture()
     qcap.install(model)
 
     # ── Prefill ───────────────────────────────────────────────────────────
-    # Pass model.config so DynamicCache creates SlidingWindowLayer for the
-    # right layers — without it every layer becomes DynamicLayer (is_sliding=False).
     cache = DynamicCache(config=model.config)
     with torch.no_grad():
         out = model(input_ids, past_key_values=cache, use_cache=True)
@@ -323,11 +378,9 @@ def generate_with_hierarchy(
     prefill_len = input_ids.size(1)
     current_pos = prefill_len
 
-    # Sliding-window layers manage their own fixed window — never touch them.
-    # Only full-attention layers get hierarchical eviction.
-    full_attn   = [l for l in range(n_layers)
-                   if not getattr(cache.layers[l], "is_sliding", False)]
-    sliding     = [l for l in range(n_layers) if l not in full_attn]
+    full_attn = [l for l in range(n_layers)
+                 if not getattr(cache.layers[l], "is_sliding", False)]
+    sliding   = [l for l in range(n_layers) if l not in full_attn]
 
     if verbose:
         print(f"\n[hierarchy] Prompt: {prefill_len} tokens")
@@ -335,11 +388,11 @@ def generate_with_hierarchy(
               f"sliding-window: {len(sliding)}")
         print(f"[hierarchy] Full-attn indices (first 10): {full_attn[:10]}")
 
-        tree = pipeline._hierarchy.get_tree()
-        print(f"\n[hierarchy] Tree — {len(tree.leaf_clusters)} leaf clusters, "
-              f"{len(tree.topic_nodes)} topic nodes")
+        _tree = pipeline._hierarchy.get_tree()
+        print(f"\n[hierarchy] Tree — {len(_tree.leaf_clusters)} leaf clusters, "
+              f"{len(_tree.topic_nodes)} topic nodes")
         nodes_info = hier["nodes"]
-        for cid, cluster in sorted(tree.leaf_clusters.items()):
+        for cid, cluster in sorted(_tree.leaf_clusters.items()):
             positions = sorted({
                 p
                 for nid in cluster.member_node_ids
@@ -352,15 +405,14 @@ def generate_with_hierarchy(
                   f"–{positions[-1] if positions else '?'}]")
             for t in texts:
                 print(f"    · {t!r}")
-        for tid, topic in sorted(tree.topic_nodes.items()):
+        for tid, topic in sorted(_tree.topic_nodes.items()):
             print(f"  Topic {tid}: leaves {topic.leaf_cluster_ids}")
 
     # Immutable flat backing store for full-attention layers only
     prefill_keys   = {l: cache.layers[l].keys[0].clone()   for l in full_attn}
     prefill_values = {l: cache.layers[l].values[0].clone() for l in full_attn}
 
-    # Derive actual shapes from the cache (Laguna head_dim ≠ hidden_size // n_q)
-    n_kv     = next(iter(prefill_keys.values())).size(0)   # [n_kv, prefill_len, head_dim]
+    n_kv     = next(iter(prefill_keys.values())).size(0)
     head_dim = next(iter(prefill_keys.values())).size(2)
 
     # ── Build inodes for full-attention layers only ───────────────────────
@@ -391,8 +443,7 @@ def generate_with_hierarchy(
             return pk.unsqueeze(0), pv.unsqueeze(0)
 
         # Always keep: first `sink` tokens (attention sinks) and last `sink`
-        # prefill tokens (chat-template boundary / </think> / start-of-answer
-        # tokens that the model needs to know what to generate).
+        # prefill tokens (chat-template boundary / start-of-answer tokens).
         sink_pos   = set(range(min(sink, prefill_len)))
         tail_pos   = set(range(max(sink, prefill_len - sink), prefill_len))
         always_pos = sink_pos | tail_pos
@@ -427,10 +478,14 @@ def generate_with_hierarchy(
 
         return pk.unsqueeze(0), pv.unsqueeze(0)   # [1, n_kv, active, head_dim]
 
-    # ── Initialise active cache for full-attention layers ─────────────────
-    gen_keys   = {l: torch.empty(n_kv, 0, head_dim, device=device,
-                                 dtype=prefill_keys[l].dtype) for l in full_attn}
-    gen_values = {l: torch.empty_like(gen_keys[l])             for l in full_attn}
+    # ── Pre-allocate generation K/V buffers ───────────────────────────────
+    # Pre-allocating avoids O(n²) torch.cat reallocations in the decode loop.
+    _dtype     = next(iter(prefill_keys.values())).dtype
+    gen_keys   = {l: torch.empty(n_kv, max_new_tokens, head_dim, device=device, dtype=_dtype)
+                  for l in full_attn}
+    gen_values = {l: torch.empty(n_kv, max_new_tokens, head_dim, device=device, dtype=_dtype)
+                  for l in full_attn}
+    _gen_step  = 0
 
     if verbose:
         print(f"\n[hierarchy] Initial cache reconstruction "
@@ -438,10 +493,8 @@ def generate_with_hierarchy(
     for l in full_attn:
         q = qcap.queries.get(l, prefill_keys[l][:, -1, :])
         cache.layers[l].keys, cache.layers[l].values = reconstruct(
-            l, q, gen_keys[l], gen_values[l],
+            l, q, gen_keys[l][:, :_gen_step, :], gen_values[l][:, :_gen_step, :],
         )
-        if verbose and l > full_attn[min(2, len(full_attn)-1)]:
-            pass  # already printed inside reconstruct
 
     # ── Decode loop ───────────────────────────────────────────────────────
     next_tok  = out.logits[:, -1:, :].argmax(dim=-1)
@@ -461,14 +514,13 @@ def generate_with_hierarchy(
             )
         current_pos += 1
 
-        # Accumulate new token K/V for full-attention layers only
+        # Write new token K/V into pre-allocated buffers at current step index.
         for l in full_attn:
-            gen_keys[l]   = torch.cat([gen_keys[l],
-                                        cache.layers[l].keys[0, :, -1:, :]],   dim=1)
-            gen_values[l] = torch.cat([gen_values[l],
-                                        cache.layers[l].values[0, :, -1:, :]], dim=1)
+            gen_keys[l][:, _gen_step, :]   = cache.layers[l].keys[0, :, -1, :]
+            gen_values[l][:, _gen_step, :] = cache.layers[l].values[0, :, -1, :]
+        _gen_step += 1
 
-        # Every β steps: rebuild full-attention layer caches
+        # Every β steps: rebuild full-attention layer caches via Quest selection.
         if (step + 1) % beta == 0:
             if verbose:
                 print(f"\n[hierarchy] Eviction at step {step+1} "
@@ -476,7 +528,7 @@ def generate_with_hierarchy(
             for l in full_attn:
                 q = qcap.queries.get(l, prefill_keys[l][:, -1, :])
                 cache.layers[l].keys, cache.layers[l].values = reconstruct(
-                    l, q, gen_keys[l], gen_values[l]
+                    l, q, gen_keys[l][:, :_gen_step, :], gen_values[l][:, :_gen_step, :]
                 )
 
         next_tok = out.logits[:, -1:, :].argmax(dim=-1)

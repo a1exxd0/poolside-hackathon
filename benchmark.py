@@ -26,15 +26,28 @@ import os
 import subprocess
 import tempfile
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Callable
 
+import editdistance
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from kv_cache import generate_with_hierarchy
+
+# Max public test cases checked per LiveCodeBench problem.
+_MAX_LIVECODEBENCH_TEST_CASES = 3
+
+# Shared instruction template for context-based QA tasks.
+_QA_INSTRUCTION = (
+    "Answer the question based on the context. "
+    "Be concise — one phrase or sentence.\n\n"
+    "Context:\n{context}\n\n"
+    "Question: {input}\nAnswer:"
+)
 
 
 # ─── Shared utilities ─────────────────────────────────────────────────────────
@@ -74,7 +87,6 @@ def strip_fences(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
-        # Drop first line (```python or ```) and last ``` if present
         inner = lines[1:]
         if inner and inner[-1].strip() == "```":
             inner = inner[:-1]
@@ -87,16 +99,15 @@ def f1_token(pred: str, gold: str) -> float:
     g_toks = gold.lower().split()
     if not p_toks or not g_toks:
         return 0.0
-    common = set(p_toks) & set(g_toks)
+    common = sum((Counter(p_toks) & Counter(g_toks)).values())
     if not common:
         return 0.0
-    prec = len(common) / len(p_toks)
-    rec  = len(common) / len(g_toks)
+    prec = common / len(p_toks)
+    rec  = common / len(g_toks)
     return 2 * prec * rec / (prec + rec)
 
 
 def edit_similarity(pred: str, gold: str) -> float:
-    import editdistance
     if not pred and not gold:
         return 1.0
     d = editdistance.eval(pred.strip(), gold.strip())
@@ -173,9 +184,7 @@ def bench_humaneval(runner: Callable, tokenizer, n: int, ckpt: str) -> dict:
         times.append(t)
 
         code = strip_fences(completion)
-        # If model echoed the signature, keep only what follows the docstring
         if ex["entry_point"] in code:
-            # Try to keep just the body by taking everything after the prompt
             code = completion
 
         test_code = (
@@ -219,7 +228,6 @@ def bench_livecodebench(runner: Callable, tokenizer, n: int, ckpt: str) -> dict:
             split="test",
             trust_remote_code=True,
         )
-    # Sort by recency: newest problems have least training contamination
     ds = ds.sort("contest_date", reverse=True).select(range(min(n, len(ds))))
 
     passed    = 0
@@ -245,14 +253,14 @@ def bench_livecodebench(runner: Callable, tokenizer, n: int, ckpt: str) -> dict:
 
         try:
             tests = json.loads(ex["public_test_cases"])
-        except Exception:
+        except (json.JSONDecodeError, KeyError, TypeError):
             rows.append({"problem": ex.get("question_id", "?"), "skipped": True})
             continue
 
-        code = strip_fences(completion)
+        code           = strip_fences(completion)
         problem_passed = False
 
-        for tc in tests[:3]:   # check first 3 public test cases
+        for tc in tests[:_MAX_LIVECODEBENCH_TEST_CASES]:
             test_input  = tc.get("input", "")
             test_output = tc.get("output", "").strip()
             test_type   = tc.get("testtype", "stdin")
@@ -263,7 +271,6 @@ def bench_livecodebench(runner: Callable, tokenizer, n: int, ckpt: str) -> dict:
                     problem_passed = True
                     break
             else:
-                # functional: just check it runs without error on the input
                 ok, _ = safe_exec(code, stdin=test_input, timeout=10)
                 if ok:
                     problem_passed = True
@@ -320,22 +327,12 @@ LONGBENCH_CFG = {
     "2wikimqa": {
         "metric": "f1",
         "max_new": 64,
-        "instruction": (
-            "Answer the question based on the context. "
-            "Be concise — one phrase or sentence.\n\n"
-            "Context:\n{context}\n\n"
-            "Question: {input}\nAnswer:"
-        ),
+        "instruction": _QA_INSTRUCTION,
     },
     "hotpotqa": {
         "metric": "f1",
         "max_new": 64,
-        "instruction": (
-            "Answer the question based on the context. "
-            "Be concise — one phrase or sentence.\n\n"
-            "Context:\n{context}\n\n"
-            "Question: {input}\nAnswer:"
-        ),
+        "instruction": _QA_INSTRUCTION,
     },
 }
 
@@ -373,7 +370,7 @@ def bench_longbench(
                 context=ex.get("context", ""),
                 input=ex.get("input", ""),
             )
-            prompt     = format_chat(tokenizer, user_msg)
+            prompt        = format_chat(tokenizer, user_msg)
             completion, t = runner(prompt)
             times.append(t)
 
@@ -404,7 +401,7 @@ def bench_longbench(
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def main():
+def main(args: argparse.Namespace = None) -> None:
     ap = argparse.ArgumentParser(description="Benchmark hierarchical KV cache vs baseline")
     ap.add_argument("--model", default="poolside/Laguna-XS.2")
     ap.add_argument("--budget", type=int, default=1024,
@@ -419,7 +416,8 @@ def main():
     ap.add_argument("--out", default="results/benchmark.json")
     ap.add_argument("--baseline-only", action="store_true",
                     help="Skip hierarchical runner (useful for reference scoring)")
-    args = ap.parse_args()
+    if args is None:
+        args = ap.parse_args()
 
     print(f"Loading {args.model} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -489,13 +487,11 @@ def main():
     print(f"{'Benchmark':<25} {'Metric':<12} {'Baseline':>10} {'Hierarchical':>14} {'Delta':>8}")
     print("-" * 72)
     for bname in ("humaneval", "livecodebench"):
-        for rn in runners:
-            pass
         bl = all_results.get("baseline",     {}).get(bname, {})
         hi = all_results.get("hierarchical", {}).get(bname, {})
         if bl:
-            bv = bl.get("pass@1", 0.0)
-            hv = hi.get("pass@1", 0.0) if hi else float("nan")
+            bv    = bl.get("pass@1", 0.0)
+            hv    = hi.get("pass@1", 0.0) if hi else float("nan")
             delta = hv - bv if hi else float("nan")
             print(f"{bname:<25} {'pass@1':<12} {bv:>10.3f} {hv:>14.3f} {delta:>+8.3f}")
     for task in args.longbench_tasks:
@@ -503,9 +499,9 @@ def main():
         hi = all_results.get("hierarchical", {}).get("longbench", {}).get(task, {})
         if bl:
             metric = bl.get("metric", "score")
-            bv = bl.get("score", 0.0)
-            hv = hi.get("score", 0.0) if hi else float("nan")
-            delta = hv - bv if hi else float("nan")
+            bv     = bl.get("score", 0.0)
+            hv     = hi.get("score", 0.0) if hi else float("nan")
+            delta  = hv - bv if hi else float("nan")
             print(f"longbench/{task:<15} {metric:<12} {bv:>10.3f} {hv:>14.3f} {delta:>+8.3f}")
 
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -16,17 +17,16 @@ os.environ.setdefault(
 
 Path("results").mkdir(exist_ok=True)
 
-sys.argv = [
-    "benchmark.py",
-    "--model",            "poolside/Laguna-XS.2",
-    "--budget",           "1024",
-    "--humaneval",
-    "--livecodebench",
-    "--longbench",
-    "--longbench-tasks",  "lcc", "repobench-p", "2wikimqa", "hotpotqa",
-    "--n",                "100",
-    "--out",              "results/benchmark.json",
-]
-
 from benchmark import main
-main()
+
+main(argparse.Namespace(
+    model            = "poolside/Laguna-XS.2",
+    budget           = 1024,
+    n                = 100,
+    humaneval        = True,
+    livecodebench    = True,
+    longbench        = True,
+    longbench_tasks  = ["lcc", "repobench-p", "2wikimqa", "hotpotqa"],
+    out              = "results/benchmark.json",
+    baseline_only    = False,
+))

@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "poolside-cache"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+# Keep all source files in the repo root so existing imports need no changes.
+packages = ["."]

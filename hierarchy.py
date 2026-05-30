@@ -7,7 +7,6 @@ Pipeline:
         → LocalBeliefPropagator
         → DynamicCommunityDetector (Louvain)
         → OnlineHierarchy (2-level cluster tree)
-        → HierarchicalKVPolicy
 
 Standalone module; does not import from the existing TriAttention codebase.
 """
@@ -15,10 +14,9 @@ Standalone module; does not import from the existing TriAttention codebase.
 from __future__ import annotations
 
 import re
-import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import networkx as nx
@@ -36,6 +34,7 @@ EMBED_DIM = 384
 HNSW_INITIAL_MAX = 512
 HNSW_EF_CONSTRUCTION = 200
 HNSW_M = 16
+HNSW_EF_SEARCH = 50
 
 DISCOURSE_MARKERS: frozenset = frozenset({
     "however", "therefore", "furthermore", "moreover", "nevertheless",
@@ -45,8 +44,11 @@ DISCOURSE_MARKERS: frozenset = frozenset({
     "hence", "thus", "besides", "regardless", "nonetheless",
 })
 
-# Punctuation that strongly suggests a sentence boundary
 _SENTENCE_TERMINALS = frozenset(".!?")
+
+# Minimum words in the current buffer before a discourse marker at position 0
+# can trigger a boundary. Prevents freezing single-word chunks.
+MIN_DISCOURSE_CHUNK_WORDS = 3
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -73,13 +75,11 @@ class GraphNode:
     node_id: int
     text: str
     embedding: np.ndarray           # shape (EMBED_DIM,), unit-normalised
-    timestamp: float
     temporal_prev: Optional[int] = None
     temporal_next: Optional[int] = None
     semantic_edges: List[int] = field(default_factory=list)
     community_id: int = -1
     belief_score: float = 0.5
-    kv_summary: Optional[Any] = None
 
 
 @dataclass
@@ -102,19 +102,6 @@ class HierarchyTree:
     topic_nodes: Dict[int, TopicNode] = field(default_factory=dict)
     node_to_leaf: Dict[int, int] = field(default_factory=dict)    # graph_node_id → leaf_cluster_id
     leaf_to_topic: Dict[int, int] = field(default_factory=dict)   # leaf_cluster_id → topic_id
-
-
-@dataclass
-class KVEntry:
-    node_id: int
-    text_summary: str
-    embedding: np.ndarray
-    belief_score: float
-    community_id: int
-    children: List[int] = field(default_factory=list)
-    raw_kv_recent: Optional[Any] = None
-    raw_kv_important: Optional[Any] = None
-    summary_kv: Optional[Any] = None
 
 
 # ---------------------------------------------------------------------------
@@ -142,11 +129,9 @@ class SemanticGraph:
         """Add node to HNSW index, populate semantic_edges, wire temporal link."""
         self._maybe_resize()
 
-        # Add to HNSW (expects 2-D float32 array)
         emb = node.embedding.astype(np.float32)
         self._index.add_items(emb.reshape(1, -1), [node.node_id])
 
-        # Find k nearest neighbours (excluding self)
         n_query = min(self._k + 1, len(self._nodes))
         if n_query > 0:
             labels, distances = self._index.knn_query(emb.reshape(1, -1), k=n_query)
@@ -155,14 +140,12 @@ class SemanticGraph:
                     continue
                 if nbr_id not in self._nodes:
                     continue
-                # Add bidirectional semantic edges
                 if nbr_id not in node.semantic_edges:
                     node.semantic_edges.append(int(nbr_id))
                 nbr = self._nodes[int(nbr_id)]
                 if node.node_id not in nbr.semantic_edges:
                     nbr.semantic_edges.append(node.node_id)
 
-        # Wire temporal edge to previous node
         if node.temporal_prev is not None and node.temporal_prev in self._nodes:
             prev = self._nodes[node.temporal_prev]
             prev.temporal_next = node.node_id
@@ -214,23 +197,15 @@ class SemanticGraph:
             ef_construction=HNSW_EF_CONSTRUCTION,
             M=HNSW_M,
         )
-        idx.set_ef(50)
+        idx.set_ef(HNSW_EF_SEARCH)
         return idx
 
     def _maybe_resize(self) -> None:
         """Double HNSW capacity when 90% full."""
         if len(self._nodes) < int(self._max_elements * 0.9):
             return
-        new_max = self._max_elements * 2
-        new_index = self._new_index(new_max)
-        if self._nodes:
-            ids = list(self._nodes.keys())
-            embeddings = np.stack(
-                [self._nodes[i].embedding.astype(np.float32) for i in ids]
-            )
-            new_index.add_items(embeddings, ids)
-        self._index = new_index
-        self._max_elements = new_max
+        self._max_elements *= 2
+        self._index.resize_index(self._max_elements)
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +234,7 @@ class StreamingChunker:
 
         self._buffer: List[str] = []
         self._last_chunk_embedding: Optional[np.ndarray] = None
-        self._candidate_embedding: Optional[np.ndarray] = None  # cached mid-buffer embed
+        self._candidate_embedding: Optional[np.ndarray] = None
         self._node_counter: int = 0
         self._prev_node_id: Optional[int] = None
 
@@ -267,7 +242,6 @@ class StreamingChunker:
         """Feed one word. Returns a frozen GraphNode on boundary, else None."""
         self._buffer.append(word)
 
-        # Re-embed candidate periodically
         if len(self._buffer) % self._embed_every_n == 0:
             self._candidate_embedding = self._embed_text(" ".join(self._buffer))
 
@@ -290,25 +264,24 @@ class StreamingChunker:
         if not self._buffer:
             return 0.0
 
-        # --- Hard signals (0 or 1 each) ---
         last_word = self._buffer[-1]
         first_word = self._buffer[0]
 
-        # Sentence-terminal punctuation
         punct_score = 1.0 if last_word and last_word[-1] in _SENTENCE_TERMINALS else 0.0
-
-        # Paragraph break (double newline embedded in word)
         para_score = 1.0 if "\n\n" in last_word else 0.0
 
-        # Discourse marker at start of chunk
-        discourse_score = 1.0 if _word_is_discourse(first_word) else 0.0
+        # Only fire on discourse markers once enough context has accumulated;
+        # avoids freezing singleton or near-empty chunks.
+        discourse_score = (
+            1.0
+            if len(self._buffer) >= MIN_DISCOURSE_CHUNK_WORDS and _word_is_discourse(first_word)
+            else 0.0
+        )
 
-        # Max token budget
         budget_score = 1.0 if len(self._buffer) >= self._max_tokens else 0.0
 
         hard_signal = max(punct_score, para_score, discourse_score, budget_score)
 
-        # --- Soft signal: cosine shift from last chunk ---
         soft_signal = 0.0
         if self._last_chunk_embedding is not None and self._candidate_embedding is not None:
             sim = _cosine_similarity(self._last_chunk_embedding, self._candidate_embedding)
@@ -324,7 +297,6 @@ class StreamingChunker:
             node_id=self._node_counter,
             text=text,
             embedding=embedding,
-            timestamp=time.time(),
             temporal_prev=self._prev_node_id,
         )
 
@@ -383,11 +355,10 @@ class DynamicCommunityDetector:
     def __init__(self, graph: SemanticGraph) -> None:
         self._graph = graph
         self._nx: nx.Graph = nx.Graph()
-        self._global_map: Dict[int, int] = {}   # node_id → global community ID
+        self._global_map: Dict[int, int] = {}
         self._global_counter: int = 0
 
     def update(self, new_node: GraphNode) -> None:
-        # Add node and all its edges to networkx graph
         self._nx.add_node(new_node.node_id)
         for nbr_id in new_node.semantic_edges:
             if nbr_id in self._graph.nodes:
@@ -395,28 +366,23 @@ class DynamicCommunityDetector:
                 sim = _cosine_similarity(new_node.embedding, nbr.embedding)
                 self._nx.add_edge(new_node.node_id, nbr_id, weight=float(sim))
 
-        # Extract 2-hop subgraph
         affected_ids = [n.node_id for n in
                         self._graph.get_neighbourhood(new_node.node_id, radius=2)]
         subgraph = self._nx.subgraph(affected_ids).copy()
 
         if subgraph.number_of_nodes() < 2:
-            # Isolated node: assign fresh community
             cid = self._global_counter
             self._global_counter += 1
             self._global_map[new_node.node_id] = cid
             new_node.community_id = cid
             return
 
-        # Run Louvain on subgraph
         partition: Dict[int, int] = community_louvain.best_partition(
             subgraph, weight="weight", random_state=42
         )
 
-        # Reconcile local → global community IDs
         reconciled = self._reconcile(partition, list(subgraph.nodes))
 
-        # Write back to GraphNodes
         for node_id, global_cid in reconciled.items():
             self._global_map[node_id] = global_cid
             if node_id in self._graph.nodes:
@@ -428,7 +394,6 @@ class DynamicCommunityDetector:
         node_ids: List[int],
     ) -> Dict[int, int]:
         """Map Louvain local IDs → stable global IDs via plurality vote."""
-        # Group node_ids by local community
         local_groups: Dict[int, List[int]] = {}
         for nid in node_ids:
             local_cid = partition.get(nid, 0)
@@ -438,7 +403,6 @@ class DynamicCommunityDetector:
         result: Dict[int, int] = {}
 
         for local_cid, members in local_groups.items():
-            # Find plurality of previously-assigned global IDs for these members
             votes: Dict[int, int] = {}
             for nid in members:
                 if nid in self._global_map:
@@ -448,7 +412,6 @@ class DynamicCommunityDetector:
             chosen_global: Optional[int] = None
             if votes:
                 best_g, best_count = max(votes.items(), key=lambda x: x[1])
-                # Reuse if majority (>50%) and not claimed by another local community
                 if best_count > len(members) * 0.5 and best_g not in claimed_globals:
                     chosen_global = best_g
 
@@ -471,10 +434,18 @@ class DynamicCommunityDetector:
 # OnlineHierarchy — 2-level cluster tree
 # ---------------------------------------------------------------------------
 
+_CENTROID_IDX_INITIAL_MAX = 64
+
+
 class OnlineHierarchy:
     """
     Level 0: leaf clusters of semantically similar GraphNodes.
     Level 1: topic nodes grouping leaf clusters via k-means on centroids.
+
+    Cluster lookup uses a secondary HNSW index over cluster centroids for
+    O(log n) queries rather than O(n_clusters) linear scan. hnswlib lacks
+    deletion support, so split clusters are tombstoned: their ID is removed
+    from _valid_cluster_ids and ignored in query results.
     """
 
     def __init__(
@@ -495,6 +466,17 @@ class OnlineHierarchy:
         self._topic_counter = 0
         self._inserts_since_rebuild = 0
 
+        self._centroid_idx_max = _CENTROID_IDX_INITIAL_MAX
+        self._centroid_idx_count = 0          # total items added, including tombstones
+        self._valid_cluster_ids: Set[int] = set()
+        self._centroid_index = hnswlib.Index(space="cosine", dim=EMBED_DIM)
+        self._centroid_index.init_index(
+            max_elements=self._centroid_idx_max,
+            ef_construction=HNSW_EF_CONSTRUCTION,
+            M=HNSW_M,
+        )
+        self._centroid_index.set_ef(HNSW_EF_SEARCH)
+
     def insert(self, node: GraphNode) -> None:
         nearest_id, best_sim = self._find_nearest_leaf(node.embedding)
 
@@ -506,7 +488,6 @@ class OnlineHierarchy:
             if len(cluster.member_node_ids) > self._split_threshold:
                 self._split_cluster(nearest_id)
         else:
-            # Create new leaf cluster
             new_cluster = LeafCluster(
                 cluster_id=self._leaf_counter,
                 centroid=node.embedding.copy(),
@@ -514,6 +495,7 @@ class OnlineHierarchy:
             )
             self._tree.leaf_clusters[self._leaf_counter] = new_cluster
             self._tree.node_to_leaf[node.node_id] = self._leaf_counter
+            self._add_to_centroid_index(self._leaf_counter, node.embedding)
             self._leaf_counter += 1
 
         self._inserts_since_rebuild += 1
@@ -528,10 +510,34 @@ class OnlineHierarchy:
     # Private
     # ------------------------------------------------------------------
 
+    def _add_to_centroid_index(self, cluster_id: int, centroid: np.ndarray) -> None:
+        if self._centroid_idx_count >= int(self._centroid_idx_max * 0.9):
+            self._centroid_idx_max *= 2
+            self._centroid_index.resize_index(self._centroid_idx_max)
+        self._centroid_index.add_items(
+            centroid.reshape(1, -1).astype(np.float32), [cluster_id]
+        )
+        self._valid_cluster_ids.add(cluster_id)
+        self._centroid_idx_count += 1
+
     def _find_nearest_leaf(self, embedding: np.ndarray) -> Tuple[Optional[int], float]:
+        if not self._valid_cluster_ids:
+            return None, -1.0
+        # Query a small candidate set to account for tombstoned entries.
+        # Verify each candidate against the actual (potentially drifted) centroid.
+        k = min(self._centroid_idx_count, max(5, len(self._valid_cluster_ids) + 2))
+        labels, _ = self._centroid_index.knn_query(
+            embedding.reshape(1, -1).astype(np.float32), k=k
+        )
         best_id: Optional[int] = None
         best_sim = -1.0
-        for cid, cluster in self._tree.leaf_clusters.items():
+        for cid in labels[0]:
+            cid = int(cid)
+            if cid not in self._valid_cluster_ids:
+                continue
+            cluster = self._tree.leaf_clusters.get(cid)
+            if cluster is None:
+                continue
             sim = _cosine_similarity(embedding, cluster.centroid)
             if sim > best_sim:
                 best_sim = sim
@@ -561,7 +567,9 @@ class OnlineHierarchy:
         km = KMeans(n_clusters=2, n_init=3, random_state=42)
         labels = km.fit_predict(embeddings)
 
-        # Build two new clusters
+        # Tombstone the split cluster — keep it in HNSW but drop from valid set.
+        self._valid_cluster_ids.discard(cluster_id)
+
         for group_label in (0, 1):
             group_ids = [member_ids[i] for i, lbl in enumerate(labels) if lbl == group_label]
             if not group_ids:
@@ -575,9 +583,9 @@ class OnlineHierarchy:
             self._tree.leaf_clusters[self._leaf_counter] = new_cluster
             for nid in group_ids:
                 self._tree.node_to_leaf[nid] = self._leaf_counter
+            self._add_to_centroid_index(self._leaf_counter, centroid)
             self._leaf_counter += 1
 
-        # Remove original cluster
         del self._tree.leaf_clusters[cluster_id]
 
     def _rebuild_topics(self) -> None:
@@ -594,7 +602,6 @@ class OnlineHierarchy:
         ]).astype(np.float32)
 
         if k == 1:
-            # All in one topic
             topic = TopicNode(
                 topic_id=0,
                 centroid=_normalize(centroids[0]),
@@ -631,109 +638,6 @@ class OnlineHierarchy:
 
 
 # ---------------------------------------------------------------------------
-# HierarchicalKVPolicy — metadata store + retrieval plan
-# ---------------------------------------------------------------------------
-
-class HierarchicalKVPolicy:
-    """
-    Stores per-node KV metadata and produces structured retrieval plans
-    for generation (Step 8 of the algorithm).
-    """
-
-    _RECENT_WINDOW_SIZE = 5
-    _SINK_COUNT = 3
-
-    def __init__(self, graph: SemanticGraph, hierarchy: OnlineHierarchy) -> None:
-        self._graph = graph
-        self._hierarchy = hierarchy
-        self._kv_store: Dict[int, KVEntry] = {}
-        self._insertion_order: List[int] = []
-
-    def register_node(self, node: GraphNode) -> None:
-        tree = self._hierarchy.get_tree()
-        leaf_id = tree.node_to_leaf.get(node.node_id)
-        children: List[int] = []
-        if leaf_id is not None:
-            cluster = tree.leaf_clusters.get(leaf_id)
-            if cluster:
-                children = [nid for nid in cluster.member_node_ids if nid != node.node_id]
-
-        entry = KVEntry(
-            node_id=node.node_id,
-            text_summary=node.text[:120],
-            embedding=node.embedding,
-            belief_score=node.belief_score,
-            community_id=node.community_id,
-            children=children,
-        )
-        self._kv_store[node.node_id] = entry
-        self._insertion_order.append(node.node_id)
-
-    def get_retrieval_plan(
-        self,
-        query_embedding: np.ndarray,
-        top_k_communities: int = 3,
-    ) -> dict:
-        # 1. Recent window (last N nodes)
-        recent = list(self._insertion_order[-self._RECENT_WINDOW_SIZE:])
-
-        # 2. Attention sinks (highest belief_score)
-        sorted_by_belief = sorted(
-            self._kv_store.values(), key=lambda e: e.belief_score, reverse=True
-        )
-        sinks = [e.node_id for e in sorted_by_belief[: self._SINK_COUNT]]
-
-        # 3. Rank communities by avg cosine sim of members to query
-        community_scores: Dict[int, List[float]] = {}
-        for entry in self._kv_store.values():
-            cid = entry.community_id
-            sim = _cosine_similarity(query_embedding, entry.embedding)
-            community_scores.setdefault(cid, []).append(sim)
-
-        ranked_communities = sorted(
-            community_scores.keys(),
-            key=lambda cid: float(np.mean(community_scores[cid])),
-            reverse=True,
-        )[:top_k_communities]
-
-        # 4 & 5. Community representatives (highest belief per community)
-        representatives: List[int] = []
-        for cid in ranked_communities:
-            members = [e for e in self._kv_store.values() if e.community_id == cid]
-            if members:
-                rep = max(members, key=lambda e: e.belief_score)
-                representatives.append(rep.node_id)
-
-        # 6. Expanded children of representatives
-        expanded: List[int] = []
-        for rep_id in representatives:
-            entry = self._kv_store.get(rep_id)
-            if entry:
-                expanded.extend(entry.children)
-
-        policy_description = (
-            f"Attend to: {len(recent)} recent nodes, "
-            f"{len(sinks)} attention sinks, "
-            f"{len(representatives)} community representatives "
-            f"(communities {ranked_communities}), "
-            f"and {len(expanded)} expanded child nodes."
-        )
-
-        return {
-            "recent_window": recent,
-            "attention_sinks": sinks,
-            "top_communities": ranked_communities,
-            "community_representatives": representatives,
-            "expanded_children": expanded,
-            "policy_description": policy_description,
-        }
-
-    @property
-    def kv_store(self) -> Dict[int, KVEntry]:
-        return self._kv_store
-
-
-# ---------------------------------------------------------------------------
 # HierarchyPipeline — public API
 # ---------------------------------------------------------------------------
 
@@ -761,7 +665,6 @@ class HierarchyPipeline:
         topic_rebuild_every: int = 5,
         sbert_instance=None,
     ) -> None:
-        # Accept a pre-loaded SentenceTransformer to avoid reloading across calls
         self._sbert = sbert_instance if sbert_instance is not None else SentenceTransformer(sbert_model)
         self._graph = SemanticGraph(dim=EMBED_DIM, k_neighbors=k_neighbors)
         self._chunker = StreamingChunker(
@@ -778,7 +681,6 @@ class HierarchyPipeline:
             n_topics=n_topics,
             topic_rebuild_every=topic_rebuild_every,
         )
-        self._kv_policy = HierarchicalKVPolicy(self._graph, self._hierarchy)
         self._node_count = 0
 
     def process_word(self, word: str) -> Optional[int]:
@@ -812,7 +714,6 @@ class HierarchyPipeline:
             "node_count": self._node_count,
             "tree": tree,
             "nodes": nodes_summary,
-            "kv_policy": self._kv_policy,
         }
 
     def _process_node(self, node: GraphNode) -> int:
@@ -820,7 +721,6 @@ class HierarchyPipeline:
         self._bp.update(node)
         self._community.update(node)
         self._hierarchy.insert(node)
-        self._kv_policy.register_node(node)
         self._node_count += 1
         return node.node_id
 
@@ -887,12 +787,6 @@ if __name__ == "__main__":
             f"comm={info['community_id']}  cluster={info['cluster_id']}  "
             f"topic={info['topic_id']}  | {info['text'][:60]!r}"
         )
-
-    kv = result["kv_policy"]
-    dummy_query = np.random.randn(EMBED_DIM).astype(np.float32)
-    dummy_query = _normalize(dummy_query)
-    plan = kv.get_retrieval_plan(dummy_query, top_k_communities=2)
-    print(f"\nKV policy: {plan['policy_description']}")
 
     assert result["node_count"] > 0, "No nodes created"
     assert len(tree.leaf_clusters) > 0, "No leaf clusters"
