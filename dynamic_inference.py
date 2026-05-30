@@ -1,171 +1,32 @@
 """
-Dynamic Tokenization + Pooling for Laguna — end-to-end demo.
+Dynamic Tokenization + FVT for Laguna — end-to-end demo.
 
-Combines:
-  Paper 2 (Nawrot et al., 2023) — boundary detection (where to merge)
-  Paper 1 (Feher et al., 2025)  — FVT embeddings    (how to merge)
+Primary path (Feher et al., 2025 — arXiv:2411.18553, §3.1):
+  Batch-level BPE-style merging: count adjacent pair frequencies, merge the
+  most frequent pair (never crossing word boundaries), repeat m times, then
+  embed merged tokens via FVT.  Select with --method bpe (default).
 
-Pipeline
---------
-  1. Tokenise prompt with Laguna's standard tokenizer.
-  2. Detect segment boundaries (whitespace / entropy / unigram).
-  3. Average-pool subword embeddings within each segment (FVT).
-  4. Run frozen Laguna on the shorter inputs_embeds sequence.
+Legacy path (Nawrot et al., 2023):
+  Boundary detection (whitespace / entropy / unigram) followed by FVT.
+  Select with --method whitespace|entropy|unigram.
 
 Usage
 -----
+  python dynamic_inference.py --prompt "Explain transformers"
+  python dynamic_inference.py --num-merges 10 --prompt "Explain transformers"
+  python dynamic_inference.py --sample --prompt "Explain transformers"
   python dynamic_inference.py --method whitespace --prompt "Explain transformers"
-  python dynamic_inference.py --method all --prompt "Explain transformers"
-  python dynamic_inference.py --method all   # demo prompts
 """
 
 import argparse
-import re
-import time
-import os
 
-import torch
-from dotenv import load_dotenv
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from boundary_detector import detect_boundaries
-from dynamic_tokenizer import (
-    apply_dynamic_tokenization,
-    EmbeddingCache,
-    shortening_factor,
+from dynamic_tokenizer import EmbeddingCache, shortening_factor
+from inference import (
+    load_model_and_tokenizer,
+    encode_user_prompt,
+    baseline_generate,
+    dynamic_generate,
 )
-
-load_dotenv()
-
-MODEL_ID = "poolside/Laguna-XS.2"
-
-
-def strip_think_block(text: str) -> str:
-    """Remove <think>...</think> reasoning content from model output.
-
-    Laguna prepends <think> to the generation prompt.  <think> is a special
-    token so it is skipped by the tokenizer's decode, but </think> is a
-    regular text token that stays in the output.  This strips the dangling
-    closing tag (and any full think blocks, should they appear).
-    """
-    # Full <think>...</think> blocks (model re-opened one in the output)
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    # Leading whitespace + </think> — opening tag was in the input, thus skipped
-    text = re.sub(r'^\s*</think>', '', text)
-    return text.strip()
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def load_model_and_tokenizer():
-    print(f"Loading {MODEL_ID}...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_ID,
-        token=os.getenv("HF_TOKEN"),
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        token=os.getenv("HF_TOKEN"),
-    )
-    model.eval()
-    return model, tokenizer
-
-
-# ---------------------------------------------------------------------------
-# Core inference helpers
-# ---------------------------------------------------------------------------
-
-def encode_prompt(prompt: str, tokenizer, model) -> torch.Tensor:
-    """Apply the Laguna chat template and return a 1-D input_ids tensor."""
-    messages = [{"role": "user", "content": prompt}]
-    result = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        return_tensors="pt",
-    )
-    # apply_chat_template returns a plain tensor or a BatchEncoding depending
-    # on the transformers version; normalise to a tensor here.
-    if not isinstance(result, torch.Tensor):
-        result = result["input_ids"]
-    return result.squeeze(0).to(model.device)  # [L]
-
-
-def baseline_generate(input_ids: torch.Tensor, model, tokenizer, max_new_tokens: int = 64):
-    """Standard Laguna generation (no dynamic tokenization)."""
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        output_ids = model.generate(
-            input_ids.unsqueeze(0),
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
-    elapsed = time.perf_counter() - t0
-    generated = output_ids[0][input_ids.shape[0]:]
-    response = strip_think_block(tokenizer.decode(generated, skip_special_tokens=True))
-    return response, elapsed, len(generated)
-
-
-
-
-def dynamic_generate(
-    input_ids: torch.Tensor,
-    model,
-    tokenizer,
-    method: str,
-    cache: EmbeddingCache,
-    max_new_tokens: int = 64,
-) -> tuple:
-    """
-    Full dynamic-tokenization generation:
-      - Compress the prompt with FVT (Paper 1) guided by Paper 2 boundaries.
-      - Pass the merged inputs_embeds directly to model.generate().
-
-    Passing inputs_embeds to generate() avoids past_key_values cache format
-    incompatibilities across transformers versions: the model handles prefill
-    and generation in one shot from the compressed embedding sequence.
-
-    Returns (response_text, original_len, merged_len, total_elapsed).
-    """
-    original_len = input_ids.shape[0]
-
-    t0 = time.perf_counter()
-
-    # Step 1: detect boundaries (Paper 2)
-    boundaries = detect_boundaries(
-        input_ids,
-        method=method,
-        tokenizer=tokenizer,
-        model=model,
-    )
-
-    # Step 2: FVT merge (Paper 1)
-    embed_table = model.model.embed_tokens.weight  # [V, D]
-    inputs_embeds, segments = apply_dynamic_tokenization(
-        input_ids,
-        boundaries,
-        embed_table,
-    )
-    merged_len = inputs_embeds.shape[0]
-
-    # Step 3: generate directly from merged embeddings.
-    # model.generate() accepts inputs_embeds; it runs prefill + sampling
-    # in one pass so we avoid past_key_values handoff issues.
-    with torch.no_grad():
-        output_ids = model.generate(
-            inputs_embeds=inputs_embeds.unsqueeze(0),  # [1, S, D]
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
-
-    elapsed = time.perf_counter() - t0
-    generated = output_ids[0]
-    response = strip_think_block(tokenizer.decode(generated, skip_special_tokens=True))
-
-    return response, original_len, merged_len, elapsed, len(generated)
-
 
 # ---------------------------------------------------------------------------
 # Demo
@@ -178,27 +39,36 @@ DEMO_PROMPTS = [
 ]
 
 
-def run_demo(model, tokenizer, method: str, max_new_tokens: int = 64):
+def run_demo(
+    model,
+    tokenizer,
+    method: str,
+    max_new_tokens: int = 64,
+    num_merges: int | None = None,
+    sample_merges: bool = False,
+):
     cache = EmbeddingCache()
 
     print(f"\n{'='*70}")
     print(f"Method: {method.upper()}")
+    if method == "bpe":
+        merge_desc = "sampled" if sample_merges else (f"m={num_merges}" if num_merges else "50% of mmax")
+        print(f"Merges : {merge_desc}")
     print(f"{'='*70}")
 
     for prompt in DEMO_PROMPTS:
         print(f"\nPrompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
 
-        input_ids = encode_prompt(prompt, tokenizer, model)
+        input_ids = encode_user_prompt(prompt, tokenizer, model)
         orig_len = input_ids.shape[0]
 
-        # Baseline
-        baseline_resp, baseline_time, baseline_gen = baseline_generate(
+        baseline_resp, baseline_time, baseline_gen, _ttft, _mem = baseline_generate(
             input_ids, model, tokenizer, max_new_tokens
         )
 
-        # Dynamic tokenization
-        dyn_resp, orig_len, merged_len, dyn_time, dyn_gen = dynamic_generate(
-            input_ids, model, tokenizer, method, cache, max_new_tokens
+        dyn_resp, merged_len, dyn_time, dyn_gen, _ttft, _mem, _btime = dynamic_generate(
+            input_ids, model, tokenizer, method, cache, max_new_tokens,
+            num_merges=num_merges, sample_merges=sample_merges,
         )
 
         sf = shortening_factor(orig_len, merged_len)
@@ -207,8 +77,11 @@ def run_demo(model, tokenizer, method: str, max_new_tokens: int = 64):
 
         print(f"  Original tokens : {orig_len}  →  {merged_len} merged  (SF {sf:.2f}x)")
         print(f"  Baseline : {baseline_time:.2f}s  {baseline_gen} gen_tok  {baseline_tps:.1f} tok/s")
-        print(f"  Dynamic  : {dyn_time:.2f}s  {dyn_gen} gen_tok  {dyn_tps:.1f} tok/s"
-              f"  ({dyn_tps/baseline_tps:.2f}x)" if baseline_tps > 0 else "")
+        if baseline_tps > 0:
+            print(f"  Dynamic  : {dyn_time:.2f}s  {dyn_gen} gen_tok  {dyn_tps:.1f} tok/s"
+                  f"  ({dyn_tps/baseline_tps:.2f}x)")
+        else:
+            print(f"  Dynamic  : {dyn_time:.2f}s  {dyn_gen} gen_tok  {dyn_tps:.1f} tok/s")
         print(f"  Baseline output : {baseline_resp[:120]!r}")
         print(f"  Dynamic output  : {dyn_resp[:120]!r}")
 
@@ -223,9 +96,24 @@ def main():
     )
     parser.add_argument(
         "--method",
-        choices=["whitespace", "entropy", "unigram", "all"],
-        default="whitespace",
-        help="Boundary detection method (Paper 2)",
+        choices=["bpe", "whitespace", "entropy", "unigram", "all"],
+        default="bpe",
+        help=(
+            "bpe: batch-level BPE merging (Feher et al. 2025, default); "
+            "whitespace/entropy/unigram: legacy boundary-detection methods (Nawrot et al. 2023)"
+        ),
+    )
+    parser.add_argument(
+        "--num-merges",
+        type=int,
+        default=None,
+        dest="num_merges",
+        help="Number of BPE merge steps (bpe method only). Default: 50%% of mmax.",
+    )
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="Sample m ~ U(0, mmax) per prompt instead of a fixed merge count (bpe method only).",
     )
     parser.add_argument(
         "--max_new_tokens",
@@ -242,18 +130,18 @@ def main():
     args = parser.parse_args()
 
     model, tokenizer = load_model_and_tokenizer()
-    methods = ["whitespace", "entropy", "unigram"] if args.method == "all" else [args.method]
+    methods = ["bpe", "whitespace", "entropy", "unigram"] if args.method == "all" else [args.method]
 
     if args.prompt:
         cache = EmbeddingCache()
-        input_ids = encode_prompt(args.prompt, tokenizer, model)
+        input_ids = encode_user_prompt(args.prompt, tokenizer, model)
         orig_len = input_ids.shape[0]
 
         print(f"\nPrompt : {args.prompt}")
         print(f"Tokens : {orig_len}  |  max_new_tokens={args.max_new_tokens}")
         print("─" * 70)
 
-        baseline_resp, baseline_time, baseline_gen = baseline_generate(
+        baseline_resp, baseline_time, baseline_gen, baseline_ttft, _mem = baseline_generate(
             input_ids, model, tokenizer, args.max_new_tokens
         )
         baseline_tps = baseline_gen / baseline_time if baseline_time > 0 else 0
@@ -261,8 +149,9 @@ def main():
         print(f"[baseline] {baseline_resp}\n")
 
         for method in methods:
-            dyn_resp, orig_len, merged_len, dyn_time, dyn_gen = dynamic_generate(
-                input_ids, model, tokenizer, method, cache, args.max_new_tokens
+            dyn_resp, merged_len, dyn_time, dyn_gen, _ttft, _mem, _btime = dynamic_generate(
+                input_ids, model, tokenizer, method, cache, args.max_new_tokens,
+                num_merges=args.num_merges, sample_merges=args.sample,
             )
             sf = shortening_factor(orig_len, merged_len)
             dyn_tps = dyn_gen / dyn_time if dyn_time > 0 else 0
@@ -272,7 +161,10 @@ def main():
             print(f"[{method}] {dyn_resp}\n")
     else:
         for method in methods:
-            run_demo(model, tokenizer, method, args.max_new_tokens)
+            run_demo(
+                model, tokenizer, method, args.max_new_tokens,
+                num_merges=args.num_merges, sample_merges=args.sample,
+            )
 
 
 if __name__ == "__main__":
