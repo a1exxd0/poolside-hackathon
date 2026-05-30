@@ -1,23 +1,20 @@
 """
 Benchmark dynamic tokenization on Laguna's official evaluation suite.
 
-Laguna XS.2 is evaluated on four benchmarks (model card, April 2026):
-  - SWE-bench Verified     68.2% pass@1
-  - SWE-bench Multilingual 62.4% pass@1
-  - SWE-bench Pro          44.5% pass@1
-  - Terminal-Bench 2.0     30.1% pass@1
+Both Laguna models are supported (model card, April 2026):
+  Model       SWE-bench Verified  SWE-bench Pro  Terminal-Bench 2.0
+  XS.2        68.2%               44.5%          30.1%
+  M.1         72.5%               46.9%          —
 
-Full pass@1 scoring requires the sandboxed Poolside agent harness (repo
-checkout + test runner). This script handles everything that can be measured
-locally — prompt compression, generation speed, and raw patch output — then
-saves results to JSONL so the patches can be fed to the official harness.
+When --model both is used, models are loaded and unloaded sequentially so
+only one sits in VRAM at a time.
 
 What this script measures
 -------------------------
   - original_tokens   : tokens in the chat-formatted prompt
   - merged_tokens     : tokens after FVT boundary merging
   - shortening_factor : original / merged  (higher = more compression)
-  - baseline_time_s   : wall-clock time for standard Laguna generation
+  - baseline_time_s   : wall-clock time for standard generation (no modification)
   - dynamic_time_s    : wall-clock time with dynamic tokenization
   - speedup           : baseline_time / dynamic_time
   - baseline_response : raw text from standard generation
@@ -27,30 +24,18 @@ Pass@1 (patch correctness) must be computed separately with the harness.
 
 Usage
 -----
-  # SWE-bench Verified, 20 samples, all boundary methods
-  python benchmark.py --benchmark swe_verified --n 20 --method all
+  # XS.2 only, SWE-bench Verified, 20 samples, whitespace method
+  python benchmark.py --model xs2 --benchmark swe_verified --n 20 --method whitespace
 
-  # SWE-bench Multilingual, whitespace only, save results
-  python benchmark.py --benchmark swe_multilingual --n 50 --method whitespace
+  # Both models, all benchmarks, 10 samples, all methods
+  python benchmark.py --model both --benchmark all --n 10 --method all
 
-  # SWE-bench Pro
-  python benchmark.py --benchmark swe_pro --n 20 --method whitespace
-
-  # Terminal-Bench 2.0
-  python benchmark.py --benchmark terminal_bench --n 20 --method whitespace
-
-  # All benchmarks, 10 samples each
-  python benchmark.py --benchmark all --n 10 --method whitespace
-
-Datasets (loaded from HuggingFace)
------------------------------------
-  princeton-nlp/SWE-bench_Verified
-  princeton-nlp/SWE-bench_Multimodal   (proxy for Multilingual)
-  princeton-nlp/SWE-bench              (Pro uses the full verified split)
-  terminal-bench/terminal-bench        (Terminal-Bench 2.0)
+  # M.1 only, SWE-bench Verified
+  python benchmark.py --model m1 --benchmark swe_verified --n 20 --method whitespace
 """
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -68,19 +53,40 @@ from dynamic_tokenizer import apply_dynamic_tokenization, EmbeddingCache, shorte
 
 load_dotenv()
 
-MODEL_ID = "poolside/Laguna-XS.2"
+# ---------------------------------------------------------------------------
+# Model configs
+# ---------------------------------------------------------------------------
+
+MODEL_CONFIGS = {
+    "xs2": {
+        "model_id": "poolside/Laguna-XS.2",
+        "label": "Laguna XS.2",
+    },
+    "m1": {
+        "model_id": "poolside/Laguna-M.1",
+        "label": "Laguna M.1",
+    },
+}
+
+# Reported scores (model card, April 2026) — for reference only
+LAGUNA_SCORES = {
+    "xs2": {
+        "swe_verified":     0.682,
+        "swe_multilingual": 0.624,
+        "swe_pro":          0.445,
+        "terminal_bench":   0.301,
+    },
+    "m1": {
+        "swe_verified":     0.725,
+        "swe_multilingual": None,
+        "swe_pro":          0.469,
+        "terminal_bench":   None,
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Benchmark dataset configs
 # ---------------------------------------------------------------------------
-
-# Reported Laguna XS.2 scores (model card, April 2026) — for reference only
-LAGUNA_SCORES = {
-    "swe_verified":     {"metric": "pass@1", "score": 0.682},
-    "swe_multilingual": {"metric": "pass@1", "score": 0.624},
-    "swe_pro":          {"metric": "pass@1", "score": 0.445},
-    "terminal_bench":   {"metric": "pass@1", "score": 0.301},
-}
 
 BENCHMARK_CONFIGS = {
     "swe_verified": {
@@ -116,23 +122,34 @@ BENCHMARK_CONFIGS = {
 }
 
 # ---------------------------------------------------------------------------
-# Model loading
+# Model loading / unloading
 # ---------------------------------------------------------------------------
 
-def load_model_and_tokenizer():
-    print(f"Loading {MODEL_ID}...")
+def load_model_and_tokenizer(model_key: str):
+    cfg = MODEL_CONFIGS[model_key]
+    model_id = cfg["model_id"]
+    print(f"\nLoading {cfg['label']} ({model_id})...")
     tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_ID,
+        model_id,
         token=os.getenv("HF_TOKEN"),
     )
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
+        model_id,
         dtype=torch.bfloat16,
         device_map="auto",
         token=os.getenv("HF_TOKEN"),
     )
     model.eval()
     return model, tokenizer
+
+
+def unload_model(model):
+    """Free VRAM before loading the next model."""
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("Model unloaded.")
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +270,7 @@ def dynamic_generate(
 
 def run_benchmark(
     name: str,
+    model_key: str,
     model,
     tokenizer,
     methods: list,
@@ -261,14 +279,16 @@ def run_benchmark(
     output_path: Path | None,
 ):
     cfg = BENCHMARK_CONFIGS[name]
-    ref = LAGUNA_SCORES.get(name, {})
+    model_label = MODEL_CONFIGS[model_key]["label"]
+    reported_score = LAGUNA_SCORES.get(model_key, {}).get(name)
     build_prompt = PROMPT_BUILDERS[cfg["prompt_fn"]]
     system = build_system_prompt(cfg)
 
     print(f"\n{'='*72}")
     print(f"Benchmark : {cfg['description']}")
-    if ref:
-        print(f"Laguna XS.2 reported score: {ref['score']*100:.1f}% {ref['metric']}")
+    print(f"Model     : {model_label}")
+    if reported_score is not None:
+        print(f"Reported pass@1 (full harness): {reported_score*100:.1f}%")
     if "note" in cfg:
         print(f"Note      : {cfg['note']}")
     print(f"Methods   : {methods}   n={n}   max_new_tokens={max_new_tokens}")
@@ -309,6 +329,7 @@ def run_benchmark(
 
             record = {
                 "benchmark": name,
+                "model": model_key,
                 "instance_id": instance_id,
                 "original_tokens": orig_len,
                 "max_new_tokens": max_new_tokens,
@@ -362,30 +383,37 @@ def print_summary(all_results: list, methods: list):
     if not all_results:
         return
 
-    by_bench: dict = {}
+    # Group by (model, benchmark)
+    by_model_bench: dict = {}
     for r in all_results:
-        by_bench.setdefault(r["benchmark"], []).append(r)
+        key = (r["model"], r["benchmark"])
+        by_model_bench.setdefault(key, []).append(r)
 
     print(f"\n{'='*72}")
     print("SUMMARY")
     print(f"{'='*72}")
 
-    for bench_name, records in by_bench.items():
+    for (model_key, bench_name), records in sorted(by_model_bench.items()):
         cfg = BENCHMARK_CONFIGS[bench_name]
-        ref = LAGUNA_SCORES.get(bench_name, {})
+        model_label = MODEL_CONFIGS[model_key]["label"]
+        reported = LAGUNA_SCORES.get(model_key, {}).get(bench_name)
         n = len(records)
-        print(f"\n{cfg['description']}  (n={n})")
-        if ref:
-            print(f"  Reported pass@1 (full harness): {ref['score']*100:.1f}%")
+        print(f"\n{model_label} — {cfg['description']}  (n={n})")
+        if reported is not None:
+            print(f"  Reported pass@1 (full harness): {reported*100:.1f}%")
 
         orig_tokens = [r["original_tokens"] for r in records]
         print(f"  Avg prompt length : {sum(orig_tokens)/n:.0f} tokens")
+        baseline_times = [r["baseline_time_s"] for r in records]
+        print(f"  Avg baseline time : {sum(baseline_times)/n:.1f}s  (no modification)")
 
         for method in methods:
             sfs = [r["methods"][method]["shortening_factor"]
-                   for r in records if method in r["methods"]]
+                   for r in records if method in r.get("methods", {})
+                   and "shortening_factor" in r["methods"][method]]
             speedups = [r["methods"][method]["speedup"]
-                        for r in records if method in r["methods"]]
+                        for r in records if method in r.get("methods", {})
+                        and "speedup" in r["methods"][method]]
             if not sfs:
                 continue
             print(f"  [{method}]  avg SF {sum(sfs)/len(sfs):.2f}x  "
@@ -399,6 +427,12 @@ def print_summary(all_results: list, methods: list):
 def main():
     parser = argparse.ArgumentParser(
         description="Benchmark dynamic tokenization on Laguna's evaluation suite"
+    )
+    parser.add_argument(
+        "--model",
+        choices=["xs2", "m1", "both"],
+        default="xs2",
+        help="Which Laguna model(s) to run. 'both' loads them sequentially.",
     )
     parser.add_argument(
         "--benchmark",
@@ -428,34 +462,42 @@ def main():
         "--output",
         type=str,
         default=None,
-        help="Path to write JSONL results (appended; default: benchmark_<name>_results.jsonl)",
+        help="JSONL file to append results to (default: auto-named per model+benchmark)",
     )
     args = parser.parse_args()
 
-    model, tokenizer = load_model_and_tokenizer()
-
     methods = ["whitespace", "entropy", "unigram"] if args.method == "all" else [args.method]
     benchmarks = list(BENCHMARK_CONFIGS) if args.benchmark == "all" else [args.benchmark]
+    model_keys = ["xs2", "m1"] if args.model == "both" else [args.model]
 
     run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     all_results = []
-    for bench in benchmarks:
-        if args.output:
-            out_path = Path(args.output)
-        else:
-            out_path = Path(f"benchmark_{bench}_{run_ts}.jsonl")
 
-        results = run_benchmark(
-            name=bench,
-            model=model,
-            tokenizer=tokenizer,
-            methods=methods,
-            n=args.n,
-            max_new_tokens=args.max_new_tokens,
-            output_path=out_path,
-        )
-        all_results.extend(results)
-        print(f"\nResults saved to {out_path}")
+    for model_key in model_keys:
+        model, tokenizer = load_model_and_tokenizer(model_key)
+
+        for bench in benchmarks:
+            if args.output:
+                out_path = Path(args.output)
+            else:
+                out_path = Path(f"benchmark_{model_key}_{bench}_{run_ts}.jsonl")
+
+            results = run_benchmark(
+                name=bench,
+                model_key=model_key,
+                model=model,
+                tokenizer=tokenizer,
+                methods=methods,
+                n=args.n,
+                max_new_tokens=args.max_new_tokens,
+                output_path=out_path,
+            )
+            all_results.extend(results)
+            print(f"\nResults saved to {out_path}")
+
+        if args.model == "both":
+            unload_model(model)
+            del tokenizer
 
     print_summary(all_results, methods)
 
