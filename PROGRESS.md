@@ -70,6 +70,37 @@ exact/partial/short/mixed/long(12k) cases.
   given the 2e-3 kernel agreement (same fragility the needle metric note calls out);
   the fused path accumulates in fp32, i.e. strictly higher precision than flash-bf16.
 
+### Quantization pipeline vs *only flash decode* (bf16, KVD=auto = the real ceiling)
+The "2.4–10×" above is vs the **dense-dequant fallback**. Against real bf16
+**FlashAttention** (`KVD=auto`, FLASH_ATTN backend, no quant) the int4 pipeline is still
+a *regression* — that is the honest cost of software KV quant on this hardware:
+
+- **End-to-end** HumanEval (`scripts/longctx_code_serving.py`, N=20, 256-tok greedy):
+  | regime | bf16 flash | int4 fused | regression |
+  |--:|:--:|:--:|:--:|
+  | short (~200) | 28s, 20/20 | 30s, 19/20 | ~1.07× |
+  | long (12k)   | **22s, 20/20** | **52s, 16/20** | **~2.4×** |
+
+- **Isolated decode-attention kernel** (`scripts/bench_quant_vs_flash.py`, one step, B300):
+  int4 fused vs `flash_attn_varlen` on identical shapes —
+  | B | ctx | bf16 flash ms | int4 read ms | +store | slowdown |
+  |--:|----:|------:|------:|------:|------:|
+  | 1 | 12k | 0.027 | 0.471 | +0.05 | **~18×** |
+  | 1 | 32k | 0.034 | 1.188 | +0.05 | **~35×** |
+  | 8 | 12k | 0.068 | 1.214 | +0.05 | **~18×** |
+  Per-token store-quant is cheap (~0.05 ms/step); the cost is the **read**.
+
+**Why:** the int4 decode is *overhead/compute-bound, not bandwidth-bound* — it moves ~4×
+fewer bytes than bf16 yet is ~18× slower, so it never cashes in the 4-bit bandwidth win.
+Causes: in-kernel int4→fp32 unpack (ALU-heavy), fp32 math instead of tensor-core bf16,
+split-K + a separate combine kernel, two Triton launches/step, and eager-only (no CUDA
+graph) vs FA's warp-specialized hand-tuned CUDA. So fusion removed the *dense-materialize*
+penalty but the quantized decode is fundamentally a software path competing with
+FlashAttention. **Net: int4 KV buys memory (3.2× cache) at ~2.4× decode latency @12k; the
+gap is decode-attention only — prefill/MoE/sampling are shared.** Levers to close it (all
+future work): bf16 tensor-core dequant-matmul (cast deq K/V to bf16 for `tl.dot`), fuse the
+combine into the decode epilogue, fewer/larger splits, CUDA-graph capture + warmup.
+
 ## Run recipes (see VLLM_SETUP.md)
 ```
 cd /tmp   # run from NON-vllm cwd to avoid package shadowing
