@@ -140,8 +140,36 @@ Logs: `/tmp/needle_srv_{bf16,int4_fixed}.log`,
   Reality check: even fully tuned, a software int4-dequant decode may not *beat* FA — the
   honest target is "close the latency gap so the 3.2× cache-memory win is worth it," not
   "faster than bf16."
-- **Long-context quality:** the 12k HumanEval gap (80 vs 100) is the lever — try keeping a
-  short bf16 recent-token tail (like `int4_kivi/hf_cache.py`) or asymmetric/zero-point K.
+- 🟡 **Long-context quality (INVESTIGATED, branch `kv-quant-long-context`):** built the
+  named lever — a configurable **bf16 recent-token residual window** — and benchmarked it.
+  **Finding: there is no coding-pass@1 gap to close on the HF generate path; INT4-KIVI is
+  already at bf16 parity through 32k there.** So the lever, on *this* path, is bounded-cost
+  insurance, not a pass@1 win. Details:
+  - New, additive code (DO-NOT-MODIFY files untouched):
+    `int4_kivi/residual_hf_cache.py` (`ResidualInt4KiviCache(config, residual=R)`): freezes a
+    16-token page to INT4 only once it falls entirely *before* the trailing `R` tokens, so the
+    last `R` (+ partial) tokens stay exact bf16. `residual=0` is **bit-identical** to
+    `Int4KiviCache` (validated). Bench: `scripts/longctx_residual_ab.py`; kernel-free
+    correctness check: `scripts/validate_residual_cache.py` (trailing window exact, older
+    tokens carry int4 error, base path makes recent tokens lossy).
+  - **Executed HumanEval pass@1, HF path, greedy, N=20** (int4 `r0` = existing cache,
+    int4 `res` = residual window, bf16 = ceiling):
+    | regime | int4 r0 | int4 res | bf16 |
+    |--:|:--:|:--:|:--:|
+    | long 12k (residual=128) | 19/20 (95%) | 17/20 (85%) | 18/20 (90%) |
+    | long 32k (residual=256, 15 probs) | 14/15 | 14/15 | 14/15 |
+    At 12k int4 `r0` already ≥ bf16 (no gap); `res` lost 2 to greedy single-token-flip FP
+    noise — the exact fragility the needle note above flags. At 32k all three are **identical**
+    (the one miss, #11, fails for bf16 too → hard problem, not a quant artifact). Cache ratio:
+    3.20×→3.13× (12k, R=128); the residual window costs a small, **seq-length-independent**
+    `R·H·D·2 B` per K/V.
+  - **Why no gap here (but 80% in the serving table):** the HF path quantizes with **MSE
+    calibration + per-channel K**, which is accurate enough that coding pass@1 is robust to
+    32k. The documented 80%@12k gap is the *separate vLLM serving* path (per-token K/V Triton
+    store, paged). So the residual lever's coding payoff would land **there**, not on HF
+    pass@1 — but the paged uniform-int4 cache makes a bf16 recent window a much bigger change
+    (a per-request side buffer), left as the real future work. The other named lever
+    (asymmetric/zero-point K) is also serving-side and untouched.
 - ✅ **Grid y-dim (DONE, branch `kv-quant-grid-y-dim`):** `_gather_dequant_kernel` grid was
   `(B, max_seq, H)`, putting the position axis on grid.y whose CUDA limit is 65535 — any
   gather with `max_seq>65535` (max_model_len past 64k) failed to launch with CUDA "invalid
