@@ -33,6 +33,15 @@ MAX_LEN="${MAX_LEN:-1048576}"
 # below from MAX_LEN -- override MAX_LEN alone and the rope factor follows.
 ORIG_MAX="${ORIG_MAX:-4096}"
 
+# Served model name: advertise the active context window in the id so clients
+# see this is the extended-context build. Derived from MAX_LEN so it stays
+# correct under overrides (1048576 -> "1M", 262144 -> "256k"). Override with
+# SERVED_NAME=... to set the id verbatim.
+if [ $((MAX_LEN % 1048576)) -eq 0 ]; then CTX_LABEL="$((MAX_LEN / 1048576))M"
+elif [ $((MAX_LEN % 1024)) -eq 0 ]; then CTX_LABEL="$((MAX_LEN / 1024))k"
+else CTX_LABEL="$MAX_LEN"; fi
+SERVED_NAME="${SERVED_NAME:-poolside/Laguna-XS.2-NVFP4-${CTX_LABEL}ctx}"
+
 # Public cloudflared tunnel: OFF by default -- serve only on localhost. Set
 # ENABLE_TUNNEL=1 to expose the endpoint publicly (outbound 443 quick tunnel).
 ENABLE_TUNNEL="${ENABLE_TUNNEL:-0}"
@@ -108,7 +117,7 @@ KEYARG=""; [ -n "$KEY" ] && KEYARG="--api-key $KEY"
   CUDA_HOME=/usr/local/cuda-12.8 \
   VLLM_USE_FLASHINFER_SAMPLER=0 \
   nohup "$VENV/bin/vllm" serve "$MODEL" \
-    --served-model-name poolside/Laguna-XS.2-NVFP4 \
+    --served-model-name "$SERVED_NAME" \
     --dtype bfloat16 \
     --kv-cache-dtype int4_kivi \
     --gpu-memory-utilization "$GPU_UTIL" \
@@ -154,6 +163,6 @@ else
   echo "Endpoint   : $LOCAL_URL (localhost only; ENABLE_TUNNEL=1 to expose publicly)"
 fi
 echo "API key    : ${KEY:-<none -- auth disabled>}"
-echo "Model      : poolside/Laguna-XS.2-NVFP4 (1M ctx, YaRN factor=256)"
+echo "Model      : $SERVED_NAME (${CTX_LABEL} ctx)"
 echo "Max ctx    : $MAX_LEN tokens"
 echo "Stop with  : $TOOLS/stop.sh"
