@@ -33,14 +33,26 @@ MAX_LEN="${MAX_LEN:-1048576}"
 # below from MAX_LEN -- override MAX_LEN alone and the rope factor follows.
 ORIG_MAX="${ORIG_MAX:-4096}"
 
-# API key: reuse if present, else mint one. Required -- this is a public URL.
-KEYFILE="$TOOLS/api_key.txt"
-[ -s "$KEYFILE" ] || echo "sk-laguna-$(openssl rand -hex 20)" > "$KEYFILE"
-KEY="$(cat "$KEYFILE")"
+# Public cloudflared tunnel: OFF by default -- serve only on localhost. Set
+# ENABLE_TUNNEL=1 to expose the endpoint publicly (outbound 443 quick tunnel).
+ENABLE_TUNNEL="${ENABLE_TUNNEL:-0}"
+# API key auth: OFF by default. Set REQUIRE_API_KEY=1 to mint/require a key
+# (strongly recommended whenever ENABLE_TUNNEL=1, since the URL is then public).
+REQUIRE_API_KEY="${REQUIRE_API_KEY:-0}"
+if [ "$ENABLE_TUNNEL" = "1" ] && [ "$REQUIRE_API_KEY" != "1" ]; then
+  echo "WARNING: ENABLE_TUNNEL=1 with REQUIRE_API_KEY=0 -- the public URL will be UNAUTHENTICATED." >&2
+fi
+KEY=""
+if [ "$REQUIRE_API_KEY" = "1" ]; then
+  # API key: reuse if present, else mint one.
+  KEYFILE="$TOOLS/api_key.txt"
+  [ -s "$KEYFILE" ] || echo "sk-laguna-$(openssl rand -hex 20)" > "$KEYFILE"
+  KEY="$(cat "$KEYFILE")"
+fi
 
-# cloudflared binary (gitignored; fetch if missing).
+# cloudflared binary (gitignored; fetch if missing) -- only when tunnelling.
 CF="$TOOLS/cloudflared"
-if [ ! -x "$CF" ]; then
+if [ "$ENABLE_TUNNEL" = "1" ] && [ ! -x "$CF" ]; then
   echo "Downloading cloudflared..."
   curl -fsSL -o "$CF" \
     https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -89,6 +101,8 @@ CHAT_TEMPLATE="${CHAT_TEMPLATE:-$MODEL/chat_template.jinja}"
 
 # --- vLLM ------------------------------------------------------------------
 VLOG="$TOOLS/vllm_serve.log"; : > "$VLOG"
+# Pass --api-key only when one is configured; omitted => no auth (open endpoint).
+KEYARG=""; [ -n "$KEY" ] && KEYARG="--api-key $KEY"
 # Run from a non-vllm/ cwd or `import vllm` resolves to the submodule dir.
 ( cd /tmp && \
   CUDA_HOME=/usr/local/cuda-12.8 \
@@ -105,7 +119,7 @@ VLOG="$TOOLS/vllm_serve.log"; : > "$VLOG"
     --reasoning-parser poolside_v1 \
     --host 127.0.0.1 --port "$PORT" \
     --enforce-eager \
-    --api-key "$KEY" >> "$VLOG" 2>&1 & echo $! > "$TOOLS/vllm.pid" )
+    $KEYARG >> "$VLOG" 2>&1 & echo $! > "$TOOLS/vllm.pid" )
 echo "vLLM pid $(cat "$TOOLS/vllm.pid") -- waiting for startup (model load)..."
 for _ in $(seq 1 80); do
   grep -qiE "Application startup complete" "$VLOG" && break
@@ -115,21 +129,31 @@ for _ in $(seq 1 80); do
   sleep 3
 done
 
-# --- cloudflared quick tunnel ---------------------------------------------
-TLOG="$TOOLS/cloudflared.log"; : > "$TLOG"
-nohup "$CF" tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" >> "$TLOG" 2>&1 &
-echo $! > "$TOOLS/cloudflared.pid"
+# --- cloudflared quick tunnel (opt-in via ENABLE_TUNNEL=1) -----------------
+LOCAL_URL="http://127.0.0.1:$PORT"
 URL=""
-for _ in $(seq 1 30); do
-  URL=$(grep -oE "https://[a-z0-9-]+\.trycloudflare\.com" "$TLOG" | head -1)
-  [ -n "$URL" ] && break
-  sleep 2
-done
-echo "$URL" > "$TOOLS/public_url.txt"
+if [ "$ENABLE_TUNNEL" = "1" ]; then
+  TLOG="$TOOLS/cloudflared.log"; : > "$TLOG"
+  nohup "$CF" tunnel --no-autoupdate --url "$LOCAL_URL" >> "$TLOG" 2>&1 &
+  echo $! > "$TOOLS/cloudflared.pid"
+  for _ in $(seq 1 30); do
+    URL=$(grep -oE "https://[a-z0-9-]+\.trycloudflare\.com" "$TLOG" | head -1)
+    [ -n "$URL" ] && break
+    sleep 2
+  done
+  echo "$URL" > "$TOOLS/public_url.txt"
+else
+  # No public tunnel: localhost-only. Clear any stale public URL.
+  : > "$TOOLS/public_url.txt"
+fi
 
 echo
-echo "Public URL : ${URL:-<not found -- see $TLOG>}"
-echo "API key    : $KEY"
+if [ "$ENABLE_TUNNEL" = "1" ]; then
+  echo "Public URL : ${URL:-<not found -- see $TOOLS/cloudflared.log>}"
+else
+  echo "Endpoint   : $LOCAL_URL (localhost only; ENABLE_TUNNEL=1 to expose publicly)"
+fi
+echo "API key    : ${KEY:-<none -- auth disabled>}"
 echo "Model      : poolside/Laguna-XS.2-NVFP4 (1M ctx, YaRN factor=256)"
 echo "Max ctx    : $MAX_LEN tokens"
 echo "Stop with  : $TOOLS/stop.sh"
