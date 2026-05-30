@@ -11,7 +11,8 @@ import time
 
 import torch
 from dotenv import load_dotenv
-from transformers import AutoModelForCausalLM, AutoTokenizer, BaseStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.generation.streamers import BaseStreamer
 
 from boundary_detector import detect_boundaries
 from dynamic_tokenizer import (
