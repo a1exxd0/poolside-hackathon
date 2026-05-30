@@ -10,3 +10,7 @@ __pycache__/
 *.calib
 # claude code worktrees
 .claude/
+# local serving tools: keep only the scripts, never the key/binary/logs/pids
+.tools/*
+!.tools/serve.sh
+!.tools/stop.sh
