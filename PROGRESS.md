@@ -1,156 +1,119 @@
-# INT4-KIVI vLLM serving — progress handoff
+# INT4-KIVI fused decode — benchmarks & direction
 
-**Goal:** Working, accurate, benchmarked long-context *coding* inference on
-Laguna-XS.2 served through our **custom vLLM INT4 KV-cache kernel** (per-channel-K
-KIVI layout). Branch `kv-quant`, worktree `/home/alex/poolside-hackathon-kv-quant`.
+Custom vLLM INT4-KIVI KV-cache decode on Laguna-XS.2 (40 layers, 48 q / 8 kv heads =
+GQA group 6, head_dim 128, 256-expert MoE / 8 active), B300.
+Outer worktree branch `kv-quant-speedup`; vllm submodule branch `int4-kivi-speedup`
+(commit `b9bf08cb0`). Pre-speedup A/B baseline = submodule parent `530247234`.
 
-## Status — ✅ DONE
-- ✅ Custom vLLM `int4_kivi` KV backend implemented and **serves** Laguna-XS.2 on B300.
-- ✅ Triton kernels: V per-token, K **per-channel** for full 16-tok blocks, per-token
-  fallback for partial blocks.
-- ✅ Serves accurately at scale (20-trial / 60-prompt batches to 32k context).
-- ✅ Accurate + benchmarked serving numbers obtained for int4 vs bf16 (below).
-- ✅ **Fused paged decode — v1 landed, NOT finished** (branch `kv-quant-decode-speed`,
-  vllm submodule branch `int4-kivi-decode-speed`): pure-decode batches now run a fused
-  INT4 flash-decode straight off the packed cache — no dense `(B,H,max_seq,D)`
-  materialization, K/V read at 4 bits. Validated == dense path; **2.4–10× faster than the
-  old dense-dequant fallback**. ⚠️ BUT still **~2.4× slower end-to-end (≈18× at the
-  decode-kernel level) than bf16 FlashAttention** — the dense-materialize penalty is gone,
-  the *quantized-decode-vs-FA* gap is not. **Are we done fusing? No** — see "Fused decode"
-  + the optimization levers at the bottom.
+---
 
-## Results (vLLM serving path, Laguna-XS.2, B300, enforce_eager)
-**Needle-in-code retrieval** (exact-int recall, `scripts/needle_serving.py`, 20 trials/len):
+## 1. Benchmark
 
-| ctx  | bf16 (`auto`) | int4_kivi |
-|-----:|:-------------:|:---------:|
-| 8k   | 85%           | 60%       |
-| 16k  | 95%           | 85%       |
-| 32k  | 90%           | **90%**   |
-| total| **90% (54/60)** | **78% (47/60)** |
-
-**Executed HumanEval pass@1** (`scripts/longctx_code_serving.py`, n=20, greedy):
-
-| regime              | bf16 (`auto`) | int4_kivi |
-|--------------------:|:-------------:|:---------:|
-| short (ctx ~200)    | 100% (20/20)  | 95% (19/20) |
-| long  (ctx ~12.2k)  | 100% (20/20)  | 80% (16/20) |
-
-Reading: the int4 path runs end-to-end and produces correct code at long context.
-The quant cost is real and **grows with context** (expected for KV quant): ~1 problem
-at short ctx, 4 at 12k; bf16 solved all 20 long problems within the same 256-token
-budget, so the int4 long failures are genuine quant errors, not truncation. On the
-needle the int4 cost is *non-monotonic* (worst at 8k, parity at 32k) — that metric is
-exact-digit recall and is fragile to single-token logit flips, so treat HumanEval
-pass@1 as the more reliable signal.
-
-## Fused decode (decode-speed future-work item — 🟡 v1 LANDED, NOT DONE)
-**Status in one line:** the fusion that *removes the dense bf16 materialization* is
-implemented, correct, and merged-ready; the fused decode is **not yet competitive with
-bf16 FlashAttention** (~2.4× slower e2e @12k, ~18× at the kernel), and the kernel-level
-optimization levers (tensor-core bf16 `tl.dot`, fused combine, CUDA graphs) are **untouched**.
-So: done with *this* fusion step, **not** done making quantized decode fast.
-
-The old decode path (`_dequant_and_attend`) re-dequantized the **whole** context to a
-dense bf16 `(B,H,max_seq,D)` tensor every step — the bulk of decode latency. The new
-fused path (`int4_kivi_paged_decode` → `_paged_decode_kernel` + `_decode_combine_kernel`
-in `vllm/.../ops/triton_int4_kivi.py`) is a GQA-grouped split-K flash-decode that walks
-the block table and dequantizes K (per-channel for full blocks, per-token for the partial
-tail) and V (per-token) **in-kernel** in fp32, with online softmax — no dense KV. It
-fires for pure-decode batches (`max_query_len==1`, no sliding window); `_dequant_and_attend`
-stays as the fallback for continuation/mixed/windowed steps. Toggle off with
-`VLLM_INT4_NO_FUSED_DECODE=1`.
-
-**Kernel correctness** (`scripts/validate_paged_decode.py`): fused == dense gather+attend
-on the *same* packed cache, max|Δ|≈2e-3 (bf16 floor), bit-exact at L=1, across
-exact/partial/short/mixed/long(12k) cases.
-
-**Decode-kernel speed** (`scripts/bench_paged_decode.py`, one decode step, B300):
-| B | ctx | dense ms | fused ms | speedup |
-|--:|----:|---------:|---------:|--------:|
-| 1 | 12k | 1.25 | 0.47 | **2.66×** |
-| 1 | 32k | 2.92 | 1.19 | **2.45×** |
-| 8 | 12k | 9.75 | 1.21 | **8.1×** |
-
-**End-to-end A/B** (fused on vs `VLLM_INT4_NO_FUSED_DECODE=1`, same int4 cache):
-- Needle (5/len, to 32k): both **10/15 (67%)**, bucket-identical → no quality change.
-- HumanEval long (12k ctx, 256-tok greedy): gen **52s → 65s slower without fusion**
-  (~1.25× faster wall-clock; decode is only part of the step, prefill+MoE are shared).
-  pass@1 16/20 (fused) vs 18/20 (dense) — within greedy-long-gen FP-path noise at n=20
-  given the 2e-3 kernel agreement (same fragility the needle metric note calls out);
-  the fused path accumulates in fp32, i.e. strictly higher precision than flash-bf16.
-
-### Quantization pipeline vs *only flash decode* (bf16, KVD=auto = the real ceiling)
-The "2.4–10×" above is vs the **dense-dequant fallback**. Against real bf16
-**FlashAttention** (`KVD=auto`, FLASH_ATTN backend, no quant) the int4 pipeline is still
-a *regression* — that is the honest cost of software KV quant on this hardware:
-
-- **End-to-end** HumanEval (`scripts/longctx_code_serving.py`, N=20, 256-tok greedy):
-  | regime | bf16 flash | int4 fused | regression |
-  |--:|:--:|:--:|:--:|
-  | short (~200) | 28s, 20/20 | 30s, 19/20 | ~1.07× |
-  | long (12k)   | **22s, 20/20** | **52s, 16/20** | **~2.4×** |
-
-- **Isolated decode-attention kernel** (`scripts/bench_quant_vs_flash.py`, one step, B300):
-  int4 fused vs `flash_attn_varlen` on identical shapes —
-  | B | ctx | bf16 flash ms | int4 read ms | +store | slowdown |
-  |--:|----:|------:|------:|------:|------:|
-  | 1 | 12k | 0.027 | 0.471 | +0.05 | **~18×** |
-  | 1 | 32k | 0.034 | 1.188 | +0.05 | **~35×** |
-  | 8 | 12k | 0.068 | 1.214 | +0.05 | **~18×** |
-  Per-token store-quant is cheap (~0.05 ms/step); the cost is the **read**.
-
-**Why:** the int4 decode is *overhead/compute-bound, not bandwidth-bound* — it moves ~4×
-fewer bytes than bf16 yet is ~18× slower, so it never cashes in the 4-bit bandwidth win.
-Causes: in-kernel int4→fp32 unpack (ALU-heavy), fp32 math instead of tensor-core bf16,
-split-K + a separate combine kernel, two Triton launches/step, and eager-only (no CUDA
-graph) vs FA's warp-specialized hand-tuned CUDA. So fusion removed the *dense-materialize*
-penalty but the quantized decode is fundamentally a software path competing with
-FlashAttention. **Net: int4 KV buys memory (3.2× cache) at ~2.4× decode latency @12k; the
-gap is decode-attention only — prefill/MoE/sampling are shared.** Levers to close it (all
-future work): bf16 tensor-core dequant-matmul (cast deq K/V to bf16 for `tl.dot`), fuse the
-combine into the decode epilogue, fewer/larger splits, CUDA-graph capture + warmup.
-
-## Run recipes (see VLLM_SETUP.md)
+### Setup (applies to every command)
+```bash
+# Always: vLLM venv, CUDA 12.8, run from /tmp (avoid vllm/ package shadowing).
+cd /tmp
+ENV="CUDA_HOME=/usr/local/cuda-12.8 VLLM_USE_FLASHINFER_SAMPLER=0"
+PY=/home/alex/poolside-hackathon-kv-quant/.venv-vllm/bin/python
+S=/home/alex/poolside-hackathon-kv-quant/scripts
 ```
-cd /tmp   # run from NON-vllm cwd to avoid package shadowing
-CUDA_HOME=/usr/local/cuda-12.8 VLLM_USE_FLASHINFER_SAMPLER=0 KVD=int4_kivi TRIALS=20 \
-  /home/alex/poolside-hackathon-kv-quant/.venv-vllm/bin/python \
-  /home/alex/poolside-hackathon-kv-quant/scripts/needle_serving.py
-# coding bench (run once per dtype, KVD=auto then KVD=int4_kivi):
-KVD=int4_kivi N=20 PREFIX_TOKENS=12000 ... longctx_code_serving.py
-# fused-decode kernel validation + microbench (no model load):
-cd /tmp && CUDA_HOME=/usr/local/cuda-12.8 .venv-vllm/bin/python \
-  scripts/validate_paged_decode.py   # and scripts/bench_paged_decode.py
-# A/B the fused decode against the dense fallback: VLLM_INT4_NO_FUSED_DECODE=1
+**Before trusting ANY timing:** confirm the GPU is idle — a co-tenant silently corrupts
+every number (bf16-flash bounces, store shows multi-ms). Correctness is unaffected.
+```bash
+nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
 ```
-Logs: `/tmp/needle_srv_{bf16,int4_fixed}.log`,
-`/tmp/longctx_code_{bf16,int4}.log`; JSON: `/tmp/{needle_serving,longctx_code_serving}_*.json`.
+Never run a sweep concurrently with a foreground bench.
 
-## Future work (not blocking)
-- **Decode speed / finish the fusion:** 🟡 v1 done (no dense materialize), but still
-  ~2.4× slower e2e (~18× kernel) than bf16 FlashAttention — the fused decode is *not*
-  finished. Ordered levers to close the gap (biggest first):
-  1. **Tensor cores:** cast dequantized K/V to **bf16** and use `tl.dot` on bf16 (currently
-     fp32 math) — this is the dominant ~18× factor; FA wins because it runs tensor-core bf16.
-  2. **Fuse the combine** into the decode epilogue (drop the second `_decode_combine_kernel`
-     launch) and tune `(SPLIT, BLOCK_N)` per context length (autotune); fewer/larger splits.
-  3. **CUDA-graph capture** (currently eager-only) + warmup to kill per-step launch overhead
-     and the in-inference JIT spike.
-  Reality check: even fully tuned, a software int4-dequant decode may not *beat* FA — the
-  honest target is "close the latency gap so the 3.2× cache-memory win is worth it," not
-  "faster than bf16."
-- **Long-context quality:** the 12k HumanEval gap (80 vs 100) is the lever — try keeping a
-  short bf16 recent-token tail (like `int4_kivi/hf_cache.py`) or asymmetric/zero-point K.
-- ✅ **Grid y-dim (DONE, branch `kv-quant-grid-y-dim`):** `_gather_dequant_kernel` grid was
-  `(B, max_seq, H)`, putting the position axis on grid.y whose CUDA limit is 65535 — any
-  gather with `max_seq>65535` (max_model_len past 64k) failed to launch with CUDA "invalid
-  argument". Fixed by reordering to `(max_seq, B, H)`: the position axis now rides grid.x
-  (limit ~2**31); B and H stay on y/z where they fit. No tiling needed. (The fused decode
-  sidesteps this anyway — its grid is `B*H*SPLIT`.) Regression test:
-  `vllm/tests/v1/attention/test_int4_kivi_grid.py` (gather at max_seq=70000 launches +
-  round-trips; old grid raised). Verified old code raises, new code passes.
+### Correctness (run first; gate speed work on these)
+```bash
+env $ENV $PY $S/validate_paged_decode.py     # fused decode == dense gather+attend -> ALL PASS
+env $ENV $PY $S/validate_store_equiv.py       # store bytes vs golden -> STORE BIT-IDENTICAL
+#   (first run with no golden saves it to /tmp/int4_store_golden.pt; --save to refresh)
+```
 
-## DO NOT MODIFY (validated references)
-`int4_kivi/*.py`, `kv_quant.py`, `tests/test_int4_kivi.py`, `/tmp/vllm_needle.py`.
-Never use system python/pip — only `uv` / `.venv-vllm`.
+### Kernel microbench
+```bash
+env $ENV $PY $S/bench_paged_decode.py    # fused vs old dense-dequant fallback (speedup x)
+env $ENV $PY $S/bench_quant_vs_flash.py  # int4 read/store vs bf16 FlashAttention == THE gap
+env $ENV $PY $S/sweep_decode.py          # launch-param sweep (BLOCK_N/warps/stages/waves)
+```
+Tuning knobs are env-overridable: `VLLM_INT4_DECODE_{BLOCK_N,WARPS,STAGES,WAVES,SPLIT,
+MAX_SPLIT}`. Current defaults BLOCK_N=64, warps=4, stages=3, waves=4.
+
+### End-to-end serving (run once per dtype: `KVD=auto` = bf16 ceiling, `KVD=int4_kivi`)
+```bash
+# Batched throughput + executed HumanEval pass@1 (llm.chat, all prompts at once -> B~20):
+env $ENV KVD=int4_kivi N=20 PREFIX_TOKENS=12000 MAXNEW=256 $PY $S/longctx_code_serving.py
+# Single-stream latency (max_num_seqs=1 -> every decode step is batch-1):
+env $ENV KVD=int4_kivi PREFIX_TOKENS=12000 MAXNEW=256 R=8 $PY $S/decode_latency_serving.py
+```
+
+### A/B the speedup vs the pre-speedup kernel
+```bash
+cd /home/alex/poolside-hackathon-kv-quant
+git -C vllm show 530247234:vllm/v1/attention/ops/triton_int4_kivi.py \
+    > /tmp/triton_int4_kivi_OLD.py
+cp /tmp/triton_int4_kivi_OLD.py vllm/vllm/v1/attention/ops/triton_int4_kivi.py   # -> OLD
+#   ...run any bench above...
+git -C vllm checkout -- vllm/v1/attention/ops/triton_int4_kivi.py               # -> restore NEW
+```
+Toggle the fused path off (force the dense fallback) with `VLLM_INT4_NO_FUSED_DECODE=1`.
+
+### Current measured numbers (B300, clean GPU, NEW kernel; logs in `results/`)
+Correctness: `validate_paged_decode` ALL PASS (fused==dense, max|Δ|≈2e-3, bit-exact L=1);
+`validate_store_equiv` STORE BIT-IDENTICAL.
+
+Fused vs old dense-dequant fallback (`bench_paged_decode.py`): **9.4–11.9×** across
+B=1..32, ctx 4k–32k.
+
+Decode-attention read vs bf16 FlashAttention (`bench_quant_vs_flash.py`, one step):
+| B | ctx | bf16 FA ms | int4 read ms | read× | (pre-speedup) |
+|--:|----:|------:|------:|:--:|:--:|
+| 1 | 4k  | 0.027 | 0.050 | 1.9× | 6.8× |
+| 1 | 12k | 0.027 | 0.115 | 4.3× | 17.8× |
+| 1 | 32k | 0.035 | 0.279 | 8.0× | 35.3× |
+| 8 | 12k | 0.068 | 1.038 | 15.2× | 17.7× |
+| 32| 4k  | 0.091 | 1.262 | 13.9× | 16.4× |
+Per-token store: 0.024 ms (B=1) → 0.069 ms (B=32), sync-free.
+
+Batched HumanEval serving (`longctx_code_serving.py`, N=20, 12k long regime):
+| KV | short pass@1 / gen | long pass@1 / gen |
+|--:|:--:|:--:|
+| bf16 (auto) | 20/20 · 29s | 20/20 · **22s** |
+| int4 NEW | 19/20 · 35s | 18/20 · **53s** |
+| int4 OLD | 19/20 · 31s | 16/20 · **53s** |
+
+Single-stream latency (`decode_latency_serving.py`, max_num_seqs=1, 12k, 256 tok, R=8 median):
+| KV | ms/tok | tok/s | vs bf16 |
+|--:|--:|--:|:--:|
+| bf16 (auto) | 22.5 | 44.4 | — |
+| int4 NEW | 37.4 | 26.8 | 1.66× |
+| int4 OLD | 39.9 | 25.1 | 1.77× |
+
+---
+
+## 2. Direction of improvement
+
+State of the gap, by regime — the numbers above locate where work remains; this section
+names the bottlenecks, it does not propose solutions.
+
+- **Kernel, batch-1: closed.** Decode-attention read is 1.9–8× of bf16 FlashAttention
+  (was 6.8–35×). This is the regime the bf16-tensor-core change targeted.
+- **Kernel, large batch (B≥8): open, dominant.** The int4 read is still ~14–17× of bf16
+  FA and barely moved from the pre-speedup kernel. This is the largest remaining kernel
+  gap. Two structural causes are visible in the geometry: GQA group = 6 forces the QK/PV
+  `tl.dot` to pad M to 16 (10/16 tensor-core rows unused), and the int4→bf16 unpack is
+  ALU-bound rather than bandwidth-bound (it moves 3.2× fewer bytes yet runs slower).
+- **End-to-end, single-stream latency: improved, not eliminated.** int4 decode 39.9 → 37.4
+  ms/tok (1.07× NEW vs OLD); gap to bf16 1.77× → 1.66×. The int4 e2e penalty (+14.8 ms/tok
+  over bf16) is far larger than the decode-attention compute difference alone — i.e. most
+  of the single-stream e2e gap is per-step int4-backend overhead, not the attention math.
+- **End-to-end, batched throughput: unchanged.** int4 NEW ≈ OLD (~53 s). At B≈20 the read
+  sits in the still-slow large-batch regime, and on this 40-layer MoE decode-attention is a
+  small fraction of each step (expert FFN + projections + sampling, all shared/unquantized,
+  dominate), so attention-only changes cannot move batched wall-clock much. The win at this
+  scale is the 3.2× KV-cache memory (longer context / more concurrent streams), not latency.
+- **CUDA graphs: unblocked, not enabled.** The decode path is now sync-free, but the
+  metadata builder is still `AttentionCGSupport.NEVER`; graph capture has not been turned on
+  or measured.

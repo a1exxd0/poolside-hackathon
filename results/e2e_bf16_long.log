@@ -1,0 +1,43 @@
+INFO 05-30 07:14:21 [utils.py:278] non-default args: {'dtype': 'bfloat16', 'max_model_len': 14048, 'gpu_memory_utilization': 0.55, 'disable_log_stats': True, 'enforce_eager': True, 'model': 'poolside/Laguna-XS.2'}
+INFO 05-30 07:14:22 [model.py:617] Resolved architecture: LagunaForCausalLM
+INFO 05-30 07:14:22 [model.py:1751] Using max model len 14048
+INFO 05-30 07:14:22 [scheduler.py:239] Chunked prefill is enabled with max_num_batched_tokens=16384.
+INFO 05-30 07:14:22 [vllm.py:984] Asynchronous scheduling is enabled.
+WARNING 05-30 07:14:22 [vllm.py:1040] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 05-30 07:14:22 [vllm.py:1082] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 05-30 07:14:22 [kernel.py:270] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 05-30 07:14:22 [vllm.py:1258] Cudagraph is disabled under eager mode
+INFO 05-30 07:14:22 [compilation.py:321] Enabled custom fusions: norm_quant, act_quant
+(EngineCore pid=74276) INFO 05-30 07:14:24 [core.py:112] Initializing a V1 LLM engine (v0.22.1rc1.dev4+g38b864d81) with config: model='poolside/Laguna-XS.2', speculative_config=None, tokenizer='poolside/Laguna-XS.2', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=14048, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=poolside/Laguna-XS.2, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [16384], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=74276) INFO 05-30 07:14:25 [parallel_state.py:1422] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://31.22.104.178:52693 backend=nccl
+(EngineCore pid=74276) INFO 05-30 07:14:25 [parallel_state.py:1735] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+(EngineCore pid=74276) INFO 05-30 07:14:25 [topk_topp_sampler.py:70] FlashInfer top-p/top-k sampling disabled via VLLM_USE_FLASHINFER_SAMPLER=0; using PyTorch-native sampler.
+(EngineCore pid=74276) INFO 05-30 07:14:25 [gpu_model_runner.py:5036] Starting to load model poolside/Laguna-XS.2...
+(EngineCore pid=74276) INFO 05-30 07:14:29 [cuda.py:380] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'TRITON_ATTN', 'FLEX_ATTENTION'].
+(EngineCore pid=74276) INFO 05-30 07:14:29 [flash_attn.py:636] Using FlashAttention version 4
+(EngineCore pid=74276) INFO 05-30 07:14:29 [unquantized.py:285] Using TRITON Unquantized MoE backend out of potential backends: ['FlashInfer TRTLLM', 'FlashInfer CUTLASS', 'TRITON', 'BATCHED_TRITON'].
+(EngineCore pid=74276) INFO 05-30 07:14:30 [weight_utils.py:922] Filesystem type for checkpoints: EXT4. Checkpoint size: 62.30 GiB. Available RAM: 265.02 GiB.
+(EngineCore pid=74276) INFO 05-30 07:14:30 [weight_utils.py:945] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+(EngineCore pid=74276) INFO 05-30 07:14:36 [default_loader.py:397] Loading weights took 6.63 seconds
+(EngineCore pid=74276) INFO 05-30 07:14:36 [unquantized.py:341] Using MoEPrepareAndFinalizeNoDPEPModular
+(EngineCore pid=74276) INFO 05-30 07:14:37 [gpu_model_runner.py:5131] Model loading took 62.39 GiB memory and 10.573727 seconds
+(EngineCore pid=74276) WARNING 05-30 07:14:39 [fused_moe.py:1071] Using default MoE config. Performance might be sub-optimal! Config file not found at /home/alex/poolside-hackathon-kv-quant/vllm/vllm/model_executor/layers/fused_moe/configs/E=256,N=512,device_name=NVIDIA_B300_SXM6_AC.json
+(EngineCore pid=74276) INFO 05-30 07:14:41 [gpu_worker.py:469] Available KV cache memory: 82.14 GiB
+(EngineCore pid=74276) INFO 05-30 07:14:41 [kv_cache_utils.py:1733] GPU KV cache size: 537,868 tokens
+(EngineCore pid=74276) INFO 05-30 07:14:41 [kv_cache_utils.py:1734] Maximum concurrency for 14,048 tokens per request: 38.29x
+(EngineCore pid=74276) INFO 05-30 07:14:41 [jit_monitor.py:54] Kernel JIT monitor activated — Triton JIT compilations during inference will be logged as warnings.
+(EngineCore pid=74276) INFO 05-30 07:14:41 [core.py:309] init engine (profile, create kv cache, warmup model) took 4.06 s
+(EngineCore pid=74276) WARNING 05-30 07:14:41 [vllm.py:1040] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+(EngineCore pid=74276) WARNING 05-30 07:14:41 [vllm.py:1082] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(EngineCore pid=74276) INFO 05-30 07:14:41 [kernel.py:270] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+(EngineCore pid=74276) INFO 05-30 07:14:41 [vllm.py:1258] Cudagraph is disabled under eager mode
+INFO 05-30 07:14:45 [hf.py:488] Detected the chat template content format to be 'string'. You can set `--chat-template-content-format` to override this.
+(EngineCore pid=74276) WARNING 05-30 07:14:45 [jit_monitor.py:103] Triton kernel JIT compilation during inference: _compute_slot_mapping_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+(EngineCore pid=74276) WARNING 05-30 07:14:57 [jit_monitor.py:103] Triton kernel JIT compilation during inference: fused_moe_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
+=== [auto] SHORT HumanEval pass@1 ===
+  20/20 (100%)  ctx 120..236  gen 29s
+=== [auto] LONG HumanEval pass@1 ===
+  20/20 (100%)  ctx 12159..12275  gen 22s
+LONGCTX_CODE_SERVING DONE [auto]
+(EngineCore pid=74276) INFO 05-30 07:15:35 [core.py:1287] Shutdown initiated (timeout=0)
+(EngineCore pid=74276) INFO 05-30 07:15:35 [core.py:1310] Shutdown complete
