@@ -1,18 +1,12 @@
 # 4-bit KV Cache Quantization (Laguna-XS.2)
 
-A study of low-bit KV-cache quantization for vLLM. Full writeup, findings, and
-implementation notes are in **[PROBLEM.md](PROBLEM.md)**.
+In submission of Poolside AI's first hackathon, focussed on optimizing for the Laguna XS.2 with generalizability.
 
-## Finding
+## Work Completed
 
-The lever for 4-bit KV is the block **layout**, not the number format or the
-calibration. Uniform **INT4 with per-channel-K (KIVI) blocking** — a 16-token
-block per channel for K, per-token for V — beats vLLM's shipped
-NVFP4 / head_dim / absmax baseline by ~25% on K reconstruction error at identical
-memory (3.56× vs BF16), and the advantage **grows with context** (neutral below
-~512 tokens, ~20–25% KL reduction beyond 1k). 4-bit is the quality floor; INT3
-costs ~2–3× the distortion. The catch: per-channel blocking can't ride NVFP4's
-hardware microscale, so capturing it needs a software INT4 KV path.
+4-bit quantization for all kv-caches on the Laguna XS.2 NVFP4 variant, with NVFP4 weights on experts but FP16 on attention. We found a slight regression after quantizing, and another after multiplying RoPE factor by 4. Future work would fine tune the model under larger contexts (although this is very difficult, especially for a 3bn active param model).
+
+Block-based quantization on k=16 with custom kernels for k=16 vLLM default. Future work would generalise this too.
 
 ## Layout
 
